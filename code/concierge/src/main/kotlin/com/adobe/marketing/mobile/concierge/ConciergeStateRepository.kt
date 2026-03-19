@@ -68,6 +68,12 @@ internal class ConciergeStateRepository internal constructor(
     val state: StateFlow<ConciergeState> = _state.asStateFlow()
 
     /**
+     * Tracks whether the concierge:initialized event has already been dispatched.
+     * The event fires at most once per app session when all ready conditions are met.
+     */
+    private var initializedEventDispatched = false
+
+    /**
      * Sets the list of surface URLs for the chat experience. Updates [ConciergeState.surfaces].
      * Pass null or empty list to clear.
      *
@@ -81,6 +87,7 @@ internal class ConciergeStateRepository internal constructor(
             LOG_TAG,
             "Surfaces set: $surfaces"
         )
+        checkAndDispatchInitialized()
     }
 
     /**
@@ -129,8 +136,8 @@ internal class ConciergeStateRepository internal constructor(
             ConciergeConstants.EXTENSION_NAME,
             LOG_TAG,
             "Updated concierge state with ECID: $ecid"
-
         )
+        checkAndDispatchInitialized()
     }
 
     /**
@@ -189,6 +196,7 @@ internal class ConciergeStateRepository internal constructor(
             LOG_TAG,
             "Updated ConciergeState with configId: $configId, server: $server"
         )
+        checkAndDispatchInitialized()
     }
 
     /**
@@ -247,11 +255,33 @@ internal class ConciergeStateRepository internal constructor(
     }
 
     /**
+     * Checks if all ready conditions are met and dispatches the concierge:initialized
+     * tracking event once per app session.
+     *
+     * Ready conditions: configuration is loaded, ECID is available, and surfaces are set.
+     */
+    private fun checkAndDispatchInitialized() {
+        if (initializedEventDispatched) return
+
+        val current = _state.value
+        if (current.configurationReady && current.experienceCloudId != null && current.surfaces.isNotEmpty()) {
+            initializedEventDispatched = true
+            ConciergeTracker.track(ConciergeConstants.Tracking.EVENT_CONCIERGE_INITIALIZED)
+            Log.debug(
+                ConciergeConstants.EXTENSION_NAME,
+                LOG_TAG,
+                "Concierge ready — dispatched concierge:initialized"
+            )
+        }
+    }
+
+    /**
      * Clears all stored state.
      * This can be called when the extension is unregistered or for testing purposes.
      */
     fun clear() {
         _state.value = ConciergeState()
+        initializedEventDispatched = false
     }
 
     private fun getXDMSharedState(

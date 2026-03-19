@@ -70,6 +70,44 @@ internal object ConciergeConstants {
         const val DEFAULT_SUBHEADING = "Not sure where to start? Explore the suggested ideas below."
     }
 
+    object Tracking {
+        /** Prefix for XDM eventType values (e.g. "brandconcierge.query:submitted") */
+        const val XDM_EVENT_TYPE_PREFIX = "brandconcierge."
+
+        // XDM _brandconcierge field group keys
+        const val KEY_EVENT_TYPE = "concierge.eventtype"
+        const val KEY_QUERY = "concierge.query"
+        const val KEY_SUGGESTION = "concierge.suggestion"
+        const val KEY_CONVERSATION_ID = "concierge.conversationid"
+        const val KEY_INTERACTION_ID = "concierge.interactionid"
+        const val KEY_CARD_PRODUCT_NAME = "concierge.card.productname"
+        const val KEY_CARD_PRODUCT_URL = "concierge.card.producturl"
+        const val KEY_CARD_IMAGE_URL = "concierge.card.imageurl"
+        const val KEY_CARD_CLICK_TARGET = "concierge.card.clicktarget"
+        const val KEY_CARDS_COUNT = "concierge.cards.count"
+        const val KEY_CARDS_DISPLAY_MODE = "concierge.cards.displaymode"
+        const val KEY_FEEDBACK_TYPE = "concierge.feedback.type"
+        const val KEY_FEEDBACK_CATEGORIES = "concierge.feedback.categories"
+        const val KEY_FEEDBACK_NOTES = "concierge.feedback.notes"
+        const val KEY_ERROR_MESSAGE = "concierge.error.message"
+
+        // Concierge event type values
+        const val EVENT_CONCIERGE_INITIALIZED = "concierge:initialized"
+        const val EVENT_QUERY_SUBMITTED = "query:submitted"
+        const val EVENT_PROMPT_SUGGESTION_CLICKED = "promptSuggestion:clicked"
+        const val EVENT_CARD_CLICKED = "card:clicked"
+        const val EVENT_HISTORY_CLEARED = "history:cleared"
+        const val EVENT_RESPONSE_STARTED = "response:started"
+        const val EVENT_RESPONSE_COMPLETED = "response:completed"
+        const val EVENT_CARDS_RENDERED = "cards:rendered"
+        const val EVENT_FEEDBACK_SUBMITTED = "feedback:submitted"
+        const val EVENT_ERROR_OCCURRED = "error:occurred"
+
+        // Card click target values
+        const val CLICK_TARGET_BUTTON = "button"
+        const val CLICK_TARGET_IMAGE = "image"
+    }
+
     object Disclaimer {
         const val DEFAULT_TEXT = "AI responses may be inaccurate. Check answers and sources. {Terms}"
         const val DEFAULT_TERMS_LABEL = "Terms"

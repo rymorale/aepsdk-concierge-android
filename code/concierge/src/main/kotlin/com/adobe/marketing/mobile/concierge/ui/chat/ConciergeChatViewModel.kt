@@ -19,6 +19,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.adobe.marketing.mobile.concierge.ConciergeConstants
+import com.adobe.marketing.mobile.concierge.ConciergeTracker
 import com.adobe.marketing.mobile.concierge.network.Citation
 import com.adobe.marketing.mobile.concierge.network.ConciergeConversationServiceClient
 import com.adobe.marketing.mobile.concierge.network.ConversationState
@@ -134,6 +135,12 @@ class ConciergeChatViewModel : AndroidViewModel {
      * Tracks the current conversation ID from the backend response
      */
     private var currentConversationId: String? = null
+
+    /**
+     * Tracks whether the response:started event has been emitted for the current turn.
+     * Reset on each new query, set to true after the first IN_PROGRESS chunk.
+     */
+    private var responseStartedEmitted = false
 
     /**
      * Tracks whether the app has audio recording permission
@@ -359,6 +366,15 @@ class ConciergeChatViewModel : AndroidViewModel {
             return
         }
 
+        ConciergeTracker.track(
+            ConciergeConstants.Tracking.EVENT_CARD_CLICKED,
+            mapOf(
+                ConciergeConstants.Tracking.KEY_CARD_PRODUCT_NAME to button.text,
+                ConciergeConstants.Tracking.KEY_CARD_PRODUCT_URL to button.url,
+                ConciergeConstants.Tracking.KEY_CARD_CLICK_TARGET to ConciergeConstants.Tracking.CLICK_TARGET_BUTTON
+            )
+        )
+
         Log.debug(
             ConciergeConstants.EXTENSION_NAME,
             TAG,
@@ -378,6 +394,16 @@ class ConciergeChatViewModel : AndroidViewModel {
             return
         }
 
+        ConciergeTracker.track(
+            ConciergeConstants.Tracking.EVENT_CARD_CLICKED,
+            mapOf(
+                ConciergeConstants.Tracking.KEY_CARD_PRODUCT_NAME to (element.content["productName"] ?: ""),
+                ConciergeConstants.Tracking.KEY_CARD_PRODUCT_URL to url,
+                ConciergeConstants.Tracking.KEY_CARD_IMAGE_URL to (element.content["productImageURL"] ?: ""),
+                ConciergeConstants.Tracking.KEY_CARD_CLICK_TARGET to ConciergeConstants.Tracking.CLICK_TARGET_IMAGE
+            )
+        )
+
         Log.debug(
             ConciergeConstants.EXTENSION_NAME,
             TAG,
@@ -392,6 +418,10 @@ class ConciergeChatViewModel : AndroidViewModel {
      */
     private fun handlePromptSuggestionClick(suggestion: String) {
         Log.debug(ConciergeConstants.EXTENSION_NAME, TAG, "Prompt suggestion clicked: $suggestion")
+        ConciergeTracker.track(
+            ConciergeConstants.Tracking.EVENT_PROMPT_SUGGESTION_CLICKED,
+            mapOf(ConciergeConstants.Tracking.KEY_SUGGESTION to suggestion)
+        )
         // Set the suggestion text in the input field
         _inputState.update { UserInputState.Editing(suggestion) }
     }
@@ -431,6 +461,20 @@ class ConciergeChatViewModel : AndroidViewModel {
      * @param feedback The feedback data
      */
     private fun handleFeedbackSubmission(feedback: Feedback) {
+        ConciergeTracker.track(
+            ConciergeConstants.Tracking.EVENT_FEEDBACK_SUBMITTED,
+            mapOf(
+                ConciergeConstants.Tracking.KEY_CONVERSATION_ID to currentConversationId,
+                ConciergeConstants.Tracking.KEY_INTERACTION_ID to feedback.interactionId,
+                ConciergeConstants.Tracking.KEY_FEEDBACK_TYPE to when (feedback.feedbackType) {
+                    FeedbackType.POSITIVE -> ConciergeConstants.ChatInteraction.POSITIVE
+                    FeedbackType.NEGATIVE -> ConciergeConstants.ChatInteraction.NEGATIVE
+                },
+                ConciergeConstants.Tracking.KEY_FEEDBACK_CATEGORIES to feedback.selectedCategories.joinToString(","),
+                ConciergeConstants.Tracking.KEY_FEEDBACK_NOTES to feedback.notes
+            )
+        )
+
         // Update feedback state
         val feedbackState = when (feedback.feedbackType) {
             FeedbackType.POSITIVE -> FeedbackState.Positive
@@ -505,6 +549,7 @@ class ConciergeChatViewModel : AndroidViewModel {
      * Resets the chat to the initial idle state
      */
     private fun handleResetChat() {
+        ConciergeTracker.track(ConciergeConstants.Tracking.EVENT_HISTORY_CLEARED)
         _state.update {
             ChatScreenState.Idle()
         }
@@ -518,11 +563,20 @@ class ConciergeChatViewModel : AndroidViewModel {
     private fun handleSendMessage(messageText: String) {
         if (messageText.isBlank()) return
 
+        // Reset first-chunk flag for the new conversation turn
+        responseStartedEmitted = false
+
+        // Track query submission
+        ConciergeTracker.track(
+            ConciergeConstants.Tracking.EVENT_QUERY_SUBMITTED,
+            mapOf(ConciergeConstants.Tracking.KEY_QUERY to messageText)
+        )
+
         // Dismiss welcome card when user sends their first message
         if (_showWelcomeCard.value) {
             dismissWelcomeCard()
         }
-        
+
         // Mark user as returning (has seen and interacted with welcome)
         markUserAsReturning()
 
@@ -607,10 +661,40 @@ class ConciergeChatViewModel : AndroidViewModel {
 
         when (parsedMessage.state) {
             ConversationState.IN_PROGRESS -> {
+                if (!responseStartedEmitted) {
+                    responseStartedEmitted = true
+                    ConciergeTracker.track(
+                        ConciergeConstants.Tracking.EVENT_RESPONSE_STARTED,
+                        mapOf(
+                            ConciergeConstants.Tracking.KEY_CONVERSATION_ID to currentConversationId,
+                            ConciergeConstants.Tracking.KEY_INTERACTION_ID to parsedMessage.interactionId
+                        )
+                    )
+                }
                 appendToAssistantMessage(parsedMessage, contentBuilder)
             }
 
             ConversationState.COMPLETED -> {
+                ConciergeTracker.track(
+                    ConciergeConstants.Tracking.EVENT_RESPONSE_COMPLETED,
+                    mapOf(
+                        ConciergeConstants.Tracking.KEY_CONVERSATION_ID to currentConversationId,
+                        ConciergeConstants.Tracking.KEY_INTERACTION_ID to parsedMessage.interactionId
+                    )
+                )
+
+                // Track cards rendered if multimodal elements are present
+                if (parsedMessage.multimodalElements.isNotEmpty()) {
+                    val displayMode = if (parsedMessage.multimodalElements.size == 1) "single" else "carousel"
+                    ConciergeTracker.track(
+                        ConciergeConstants.Tracking.EVENT_CARDS_RENDERED,
+                        mapOf(
+                            ConciergeConstants.Tracking.KEY_CARDS_COUNT to parsedMessage.multimodalElements.size,
+                            ConciergeConstants.Tracking.KEY_CARDS_DISPLAY_MODE to displayMode
+                        )
+                    )
+                }
+
                 // For COMPLETED state, if final message is blank, keep existing content and just transition to Idle.
                 // Otherwise, replace with the final message.
                 if (parsedMessage.messageContent.isNotBlank()) {
@@ -755,6 +839,11 @@ class ConciergeChatViewModel : AndroidViewModel {
      * @param errorMessage The error message to display
      */
     private fun handleConversationError(errorMessage: String) {
+        ConciergeTracker.track(
+            ConciergeConstants.Tracking.EVENT_ERROR_OCCURRED,
+            mapOf(ConciergeConstants.Tracking.KEY_ERROR_MESSAGE to errorMessage)
+        )
+
         replaceAssistantMessageContent(
             ParsedConversationMessage(
                 messageContent = "Sorry, I encountered an error: $errorMessage",
