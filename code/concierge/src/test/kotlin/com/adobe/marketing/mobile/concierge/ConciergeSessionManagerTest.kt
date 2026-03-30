@@ -297,4 +297,33 @@ class ConciergeSessionManagerTest {
 
         verify { mockNamedCollection.setLong(ConciergeConstants.DataStoreKeys.KEY_SESSION_TIMESTAMP, customTime) }
     }
+
+    @Test
+    fun `refreshSessionActivity updates timestamp when session id exists`() {
+        val sid = "existing-session-id"
+        every { mockNamedCollection.getString(ConciergeConstants.DataStoreKeys.KEY_SESSION_ID, null) } returns sid
+
+        sessionManager.refreshSessionActivity()
+
+        verify { mockNamedCollection.setLong(ConciergeConstants.DataStoreKeys.KEY_SESSION_TIMESTAMP, testTime) }
+        verify(exactly = 0) { mockNamedCollection.setString(any(), any()) }
+    }
+
+    @Test
+    fun `refreshSessionActivity no-op when session id is null`() {
+        every { mockNamedCollection.getString(ConciergeConstants.DataStoreKeys.KEY_SESSION_ID, null) } returns null
+
+        sessionManager.refreshSessionActivity()
+
+        verify(exactly = 0) { mockNamedCollection.setLong(any(), any()) }
+    }
+
+    @Test
+    fun `refreshSessionActivity no-op when session id is whitespace only`() {
+        every { mockNamedCollection.getString(ConciergeConstants.DataStoreKeys.KEY_SESSION_ID, null) } returns "   "
+
+        sessionManager.refreshSessionActivity()
+
+        verify(exactly = 0) { mockNamedCollection.setLong(any(), any()) }
+    }
 }

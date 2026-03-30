@@ -146,6 +146,8 @@ class ConciergeConversationServiceClientTest {
         val emitted = mutableListOf<ParsedConversationMessage>()
         client.chat("hi").toList(emitted)
 
+        verify(atLeast = 1) { mockSessionManager.refreshSessionActivity() }
+
         assertEquals(2, emitted.size)
         assertEquals("Hello!", emitted[0].messageContent)
         assertEquals(ConversationState.IN_PROGRESS, emitted[0].state)

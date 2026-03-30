@@ -94,6 +94,7 @@ internal class ConciergeConversationServiceClient(
     fun chat(message: String): Flow<ParsedConversationMessage> = flow {
         val requestBody = createRequestBody(message, stateRepository.state.value)
         val request = createConversationServiceRequest(endpoint, requestBody)
+        sessionManager.refreshSessionActivity()
 
         val connection = connect(request)
         var eventOrDataReceived = false

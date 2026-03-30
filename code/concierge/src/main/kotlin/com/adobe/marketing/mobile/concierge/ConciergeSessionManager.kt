@@ -19,9 +19,10 @@ import java.util.UUID
 /**
  * Manages the Concierge session ID with timeout functionality.
  * 
- * The session ID is stored in NamedCollection along with its creation timestamp.
- * Sessions expire after 30 minutes of inactivity. When a request is made, the
- * session ID is validated and a new one is created if it has expired.
+ * The session ID is stored in NamedCollection along with a last-activity timestamp.
+ * Sessions expire after 30 minutes without a conversation request. Call
+ * [refreshSessionActivity] when a conversation request runs to extend the TTL (same
+ * sliding window as iOS SessionManager).
  *
  * @param namedCollection The data store for persisting session data. If null, will use ServiceProvider.
  * @param currentTimeProvider Provider for current time in milliseconds. Defaults to System.currentTimeMillis.
@@ -77,6 +78,25 @@ internal class ConciergeSessionManager internal constructor(
             )
             newSessionId
         }
+    }
+
+    /**
+     * Updates the stored activity time to now for the current session ID, if one exists.
+     * Invoke when starting a conversation network request so the 30-minute TTL is measured
+     * from last activity rather than session creation only.
+     */
+    fun refreshSessionActivity() {
+        val currentSessionId = dataStore.getString(ConciergeConstants.DataStoreKeys.KEY_SESSION_ID, null)
+        if (currentSessionId.isNullOrBlank()) {
+            return
+        }
+        val now = currentTimeProvider()
+        dataStore.setLong(ConciergeConstants.DataStoreKeys.KEY_SESSION_TIMESTAMP, now)
+        Log.debug(
+            ConciergeConstants.EXTENSION_NAME,
+            TAG,
+            "Refreshed session activity timestamp"
+        )
     }
 
     /**
