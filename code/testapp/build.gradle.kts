@@ -72,8 +72,13 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.7.0")
 
+    // Test app only 3rd party dependency. Loads card images in the headless sample.
+    // Pinned to 2.4.0 because Coil 2.5+ would raise the test app's kotlin-stdlib above 1.8.
+    implementation("io.coil-kt:coil-compose:2.4.0")
+
     // brand concierge from project module
     implementation(project(":concierge"))
+    implementation(project(":concierge-headless"))
 
     implementation("com.adobe.marketing.mobile:core:$mavenCoreVersion")
     implementation("com.adobe.marketing.mobile:edgeidentity:$mavenEdgeIdentityVersion")

@@ -53,6 +53,7 @@ import com.adobe.marketing.mobile.concierge.ui.chat.ConciergeChat
 import com.adobe.marketing.mobile.concierge.ui.chat.ConciergeChatViewModel
 import com.adobe.marketing.mobile.concierge.ui.theme.ConciergeTheme
 import com.adobe.marketing.mobile.concierge.ui.theme.ConciergeThemeLoader
+import com.adobe.marketing.mobile.conciergetestapp.headless.HeadlessChatActivity
 
 // FQN of the debug-only ProductCardDemoActivity. It lives in the `debug` source set, so it can't be
 // referenced by class literal from `main`; keep this string in sync if the activity is renamed/moved.
@@ -190,6 +191,24 @@ fun MainScreen() {
                 ) {
                     Text(
                         text = "📝 XML Integration",
+                        fontSize = 16.sp,
+                        color = Color.White
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Headless client demo: an app-owned UI on the standalone conversation client
+                Button(
+                    onClick = { context.startActivity(Intent(context, HeadlessChatActivity::class.java)) },
+                    modifier = Modifier.size(width = 240.dp, height = 60.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF3949AB)
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text = "🧩 Headless Chat",
                         fontSize = 16.sp,
                         color = Color.White
                     )

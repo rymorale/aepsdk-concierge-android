@@ -8,4 +8,6 @@ Documentation for integrating and customizing the Adobe Experience Platform Bran
 - [Data handoff](implementation-guide.md#data-handoff) - Send application data to Brand Concierge without a chat message
 - [Native card renderers (preview)](implementation-guide.md#native-card-renderers-preview) - Render `custom` elements with your own Compose cards, matched by `rendererId`
 - [Style Guide](style-guide.md) - Complete reference for theming and customization options
+- [Headless conversation client](headless.md) - Build your own chat UI on the conversation API, without the AEP SDK
+- [Styling a headless UI](headless-styling.md) - Style a headless chat with your own theme instead of a theme JSON
 - [Release notes](release-notes.md) - Changes and compatibility considerations

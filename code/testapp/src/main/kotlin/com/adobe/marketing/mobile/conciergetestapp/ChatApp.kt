@@ -20,7 +20,7 @@ import com.adobe.marketing.mobile.concierge.Concierge
 class ChatApp : Application() {
     companion object {
         private const val LOG_TAG = "ChatApp"
-        private const val APP_ID = "staging/1b50a869c4a2/570831bce333/launch-bcc070a55cca-development"
+        private const val APP_ID = "bf7248f92b53/c39620205a4c/launch-321b019dcbf6-development"
     }
 
     override fun onCreate() {
@@ -30,5 +30,13 @@ class ChatApp : Application() {
         MobileCore.initialize(this, APP_ID) {
             Concierge.setEdgeTrackingEnabled(true)
         }
+        var configMap = mapOf( "concierge.configId" to "1c13a804-a0b6-46ee-83df-d0134461d03d",
+            "concierge.server" to "edge.adobedc.net")
+        MobileCore.updateConfiguration(configMap)
     }
 }
+
+
+
+// use with surface "web://dsg-bc-stage.awesome-sites.corp.adobe.com/"
+//     val surfaces = listOf( "web://dsg-bc-stage.awesome-sites.corp.adobe.com/")
