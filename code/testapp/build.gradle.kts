@@ -78,7 +78,6 @@ dependencies {
 
     // brand concierge from project module
     implementation(project(":concierge"))
-    implementation(project(":concierge-headless"))
 
     implementation("com.adobe.marketing.mobile:core:$mavenCoreVersion")
     implementation("com.adobe.marketing.mobile:edgeidentity:$mavenEdgeIdentityVersion")

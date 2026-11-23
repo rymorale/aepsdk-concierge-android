@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -40,6 +41,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -55,12 +57,12 @@ import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SuggestionChip
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -72,45 +74,37 @@ import androidx.compose.ui.graphics.painter.ColorPainter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
-import com.adobe.marketing.mobile.AdobeCallbackWithError
-import com.adobe.marketing.mobile.AdobeError
-import com.adobe.marketing.mobile.concierge.headless.ConciergeClient
-import com.adobe.marketing.mobile.concierge.headless.ConciergeConfig
-import com.adobe.marketing.mobile.concierge.headless.ConciergeException
-import com.adobe.marketing.mobile.concierge.headless.Consent
-import com.adobe.marketing.mobile.concierge.headless.ConversationEvent
-import com.adobe.marketing.mobile.concierge.headless.ConversationRequest
-import com.adobe.marketing.mobile.concierge.headless.ConversationState
-import com.adobe.marketing.mobile.concierge.headless.ElementAction
-import com.adobe.marketing.mobile.concierge.headless.FeedbackRating
-import com.adobe.marketing.mobile.concierge.headless.FeedbackRequest
-import com.adobe.marketing.mobile.concierge.headless.MultimodalElement
-import com.adobe.marketing.mobile.concierge.headless.accumulate
+import com.adobe.marketing.mobile.concierge.Concierge
+import com.adobe.marketing.mobile.concierge.ConciergeAction
+import com.adobe.marketing.mobile.concierge.ConciergeConversation
+import com.adobe.marketing.mobile.concierge.ConciergeConversationState
+import com.adobe.marketing.mobile.concierge.ConciergeElement
+import com.adobe.marketing.mobile.concierge.ConciergeFeedback
+import com.adobe.marketing.mobile.concierge.ConciergeInteraction
+import com.adobe.marketing.mobile.concierge.ConciergeMessage
 import com.adobe.marketing.mobile.conciergetestapp.theme.ConciergeAppTheme
-import com.adobe.marketing.mobile.edge.identity.Identity
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.UUID
-import kotlin.coroutines.resume
 
 private const val TAG = "HeadlessChat"
-private const val SERVER = "edge-int.adobedc.net"
-private const val DATASTREAM_ID = "9572b56a-d65e-474a-9815-c811d12df33d"
 private const val SURFACE =
     "web://brand-concierge-demo-stage.corp.ethos270-stage-va7.ethos.adobe.net/customer-pages/745F37C35E4B776E0A49421B@AdobeOrg/acom_m15/index.html"
+
+// Brand Concierge routes the handoff by this keyword. Use the one your agent is configured for.
+private const val CHECKOUT_ROUTING_HINT = "successful-checkout"
 private val CARD_WIDTH = 240.dp
 private val CARD_SPACING = 12.dp
 
 /**
- * A chat UI built on the headless client. The app owns the UI, the session ID, the identity map
- * and consent. Only the ECID comes from the AEP SDK, through Edge Identity.
+ * A chat UI drawn by the app on top of [ConciergeConversation]. The extension handles the session,
+ * identity, consent and analytics; the app draws every message.
  */
 class HeadlessChatActivity : ComponentActivity() {
 
@@ -129,92 +123,78 @@ class HeadlessChatActivity : ComponentActivity() {
     }
 }
 
-data class Turn(
-    val id: Long,
-    val prompt: String,
-    val reply: ConversationEvent? = null,
-    val error: String? = null,
-    val pending: Boolean = true,
-    val rating: FeedbackRating? = null
-)
-
+/** Keeps the conversation across configuration changes and closes it with the screen. */
 class HeadlessChatViewModel : ViewModel() {
 
-    private val client = ConciergeClient(ConciergeConfig(SERVER, DATASTREAM_ID))
-    private var sessionId = UUID.randomUUID().toString()
-    private var identityMap: Map<String, Any?>? = null
-    private var nextId = 0L
-    private var turnJob: Job? = null
+    var conversation by mutableStateOf(start())
+        private set
 
-    val turns = mutableStateListOf<Turn>()
-    val isStreaming: Boolean get() = turns.any { it.pending }
+    /** Replaces the conversation with an empty one. The Concierge session stays the same. */
+    fun newChat() {
+        end()
+        conversation = start()
+    }
 
-    fun send(text: String) {
-        val message = text.trim()
-        if (message.isEmpty() || isStreaming) return
-        val id = nextId++
-        turns += Turn(id, message)
-        turnJob = viewModelScope.launch {
-            try {
-                val request = ConversationRequest(sessionId, listOf(SURFACE), identityMap(), Consent.IN, message)
-                client.converse(request).accumulate().collect { event -> update(id) { it.copy(reply = event) } }
-            } catch (e: ConciergeException) {
-                Log.w(TAG, "Turn failed", e)
-                update(id) { it.copy(error = e.message) }
-            } finally {
-                update(id) { it.copy(pending = false) }
-            }
+    /**
+     * Simulates a completed checkout for [card] and hands it to Brand Concierge, which replies in
+     * the conversation. A real app would call this after its own checkout flow finishes.
+     */
+    fun buy(card: ConciergeElement.ProductCard) {
+        val name = card.productName ?: card.id
+        Concierge.sendDataHandoff(
+            routingHint = CHECKOUT_ROUTING_HINT,
+            xdmFields = mapOf(
+                "commerce" to mapOf(
+                    "purchases" to mapOf("value" to 1),
+                    "order" to mapOf("purchaseID" to UUID.randomUUID().toString())
+                ),
+                "productListItems" to listOf(mapOf("name" to name, "quantity" to 1))
+            ),
+            localMessage = "Your order for $name is confirmed!"
+        ) { accepted, rejectReason ->
+            Log.d(TAG, "Checkout handoff for $name: accepted=$accepted, rejectReason=$rejectReason")
         }
     }
 
-    fun rate(turn: Turn, rating: FeedbackRating) {
-        val reply = turn.reply ?: return
-        val interactionId = reply.interactionId ?: return
-        update(turn.id) { it.copy(rating = rating) }
-        viewModelScope.launch {
-            try {
-                client.sendFeedback(
-                    FeedbackRequest(sessionId, identityMap(), Consent.IN, interactionId, reply.conversationId, rating)
-                )
-            } catch (e: ConciergeException) {
-                Log.w(TAG, "Feedback failed", e)
-                update(turn.id) { it.copy(rating = null) }
-            }
-        }
-    }
+    override fun onCleared() = end()
 
-    fun newSession() {
-        turnJob?.cancel()
-        turns.clear()
-        sessionId = UUID.randomUUID().toString()
-    }
+    private fun start() = Concierge.conversation(listOf(SURFACE)).also { it.track(ConciergeInteraction.Opened) }
 
-    private fun update(id: Long, change: (Turn) -> Turn) {
-        val index = turns.indexOfFirst { it.id == id }
-        if (index != -1) turns[index] = change(turns[index])
-    }
-
-    private suspend fun identityMap(): Map<String, Any?> = identityMap
-        ?: fetchEcid()?.let { ecid ->
-            mapOf("ECID" to listOf(mapOf("id" to ecid, "primary" to true))).also { identityMap = it }
-        }
-        ?: emptyMap()
-
-    private suspend fun fetchEcid(): String? = suspendCancellableCoroutine { continuation ->
-        Identity.getExperienceCloudId(object : AdobeCallbackWithError<String> {
-            override fun call(ecid: String?) = continuation.resume(ecid?.takeIf { it.isNotEmpty() })
-            override fun fail(error: AdobeError?) = continuation.resume(null)
-        })
+    private fun end() {
+        conversation.track(ConciergeInteraction.Closed)
+        conversation.close()
     }
 }
 
 @Composable
 private fun HeadlessChatScreen(viewModel: HeadlessChatViewModel) {
-    val turns = viewModel.turns
+    val conversation = viewModel.conversation
+    val messages by conversation.messages.collectAsStateWithLifecycle()
+    val state by conversation.state.collectAsStateWithLifecycle()
     var input by rememberSaveable { mutableStateOf("") }
+    var grid by rememberSaveable { mutableStateOf(false) }
     val listState = rememberLazyListState()
-    LaunchedEffect(turns.size) {
-        if (turns.isNotEmpty()) listState.animateScrollToItem(turns.lastIndex)
+    val uriHandler = LocalUriHandler.current
+    val open: (String?) -> Unit = { url -> url?.let { runCatching { uriHandler.openUri(it) } } }
+
+    // The conversation only reports interactions; the app sends suggestions, opens links and
+    // runs checkout. The primary product CTA (Buy now) checks out; other CTAs open their link.
+    val onInteraction: (ConciergeInteraction) -> Unit = { interaction ->
+        conversation.track(interaction)
+        when (interaction) {
+            is ConciergeInteraction.PromptSuggestionClicked -> conversation.send(interaction.suggestion)
+            is ConciergeInteraction.CtaClicked -> open(interaction.url)
+            is ConciergeInteraction.ProductCardClicked -> open(interaction.card.productPageUrl)
+            is ConciergeInteraction.ProductActionClicked ->
+                if (interaction.action == interaction.card.primary) viewModel.buy(interaction.card) else open(interaction.action.url)
+            is ConciergeInteraction.SourceClicked -> open(interaction.source.url)
+            is ConciergeInteraction.LinkClicked -> open(interaction.url)
+            else -> Unit
+        }
+    }
+
+    LaunchedEffect(messages.size) {
+        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
     }
 
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
@@ -223,7 +203,17 @@ private fun HeadlessChatScreen(viewModel: HeadlessChatViewModel) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text("Headless chat", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-            TextButton(onClick = viewModel::newSession) { Text("New session") }
+            Row(
+                Modifier
+                    .toggleable(value = grid, role = Role.Switch, onValueChange = { grid = it })
+                    .padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Grid", style = MaterialTheme.typography.labelLarge)
+                Spacer(Modifier.width(8.dp))
+                Switch(checked = grid, onCheckedChange = null)
+            }
+            TextButton(onClick = viewModel::newChat) { Text("New chat") }
         }
         HorizontalDivider()
         LazyColumn(
@@ -232,13 +222,20 @@ private fun HeadlessChatScreen(viewModel: HeadlessChatViewModel) {
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            items(turns, key = { it.id }) { turn ->
-                TurnView(
-                    turn = turn,
-                    showSuggestions = turn.id == turns.last().id,
-                    onSuggestion = viewModel::send,
-                    onRate = { viewModel.rate(turn, it) }
+            items(messages, key = { it.id }) { message ->
+                MessageView(
+                    message = message,
+                    showSuggestions = message.id == messages.last().id && state == ConciergeConversationState.IDLE,
+                    grid = grid,
+                    onInteraction = onInteraction,
+                    onRate = { conversation.sendFeedback(message.id, ConciergeFeedback(it)) }
                 )
+            }
+            if (state == ConciergeConversationState.RESPONDING && messages.lastOrNull()?.isStreaming != true) {
+                item { Text("…") }
+            }
+            if (state == ConciergeConversationState.FAILED) {
+                item { Text("Something went wrong. Try again.", color = MaterialTheme.colorScheme.error) }
             }
         }
         Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -250,90 +247,100 @@ private fun HeadlessChatScreen(viewModel: HeadlessChatViewModel) {
                 maxLines = 4
             )
             Spacer(Modifier.width(8.dp))
-            Button(
-                onClick = {
-                    viewModel.send(input)
-                    input = ""
-                },
-                enabled = input.isNotBlank() && !viewModel.isStreaming
-            ) { Text("Send") }
+            if (state == ConciergeConversationState.RESPONDING) {
+                OutlinedButton(onClick = conversation::cancel) { Text("Stop") }
+            } else {
+                Button(
+                    onClick = {
+                        conversation.send(input)
+                        input = ""
+                    },
+                    enabled = input.isNotBlank()
+                ) { Text("Send") }
+            }
         }
     }
 }
 
 @Composable
-private fun TurnView(
-    turn: Turn,
+private fun MessageView(
+    message: ConciergeMessage,
     showSuggestions: Boolean,
-    onSuggestion: (String) -> Unit,
-    onRate: (FeedbackRating) -> Unit
+    grid: Boolean,
+    onInteraction: (ConciergeInteraction) -> Unit,
+    onRate: (ConciergeFeedback.Rating) -> Unit
 ) {
-    val uriHandler = LocalUriHandler.current
-    val open: (String?) -> Unit = { url -> url?.let { runCatching { uriHandler.openUri(it) } } }
-    val reply = turn.reply
+    if (message.role == ConciergeMessage.Role.USER) {
+        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+            Text(
+                text = message.text,
+                modifier = Modifier
+                    .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(12.dp))
+                    .padding(12.dp)
+            )
+        }
+        return
+    }
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            text = turn.prompt,
-            modifier = Modifier
-                .align(Alignment.End)
-                .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(12.dp))
-                .padding(12.dp)
-        )
-        if (reply == null && turn.pending) Text("…")
-        if (reply != null) {
-            val response = reply.response
-            if (response.message.isNotEmpty()) Text(response.message)
-            val (products, others) = response.multimodalElements.partition { it is MultimodalElement.ProductCard }
-            if (products.size > 1) {
-                ProductCarousel(products.filterIsInstance<MultimodalElement.ProductCard>(), open)
-            } else {
-                products.forEach { ElementView(it, open) }
+        if (message.text.isNotEmpty()) Text(message.text)
+        val (products, others) = message.elements.partition { it is ConciergeElement.ProductCard }
+        val cards = products.filterIsInstance<ConciergeElement.ProductCard>()
+        if (cards.size > 1 && grid) {
+            ProductGrid(cards, onInteraction)
+        } else if (cards.size > 1) {
+            ProductCarousel(cards, onInteraction)
+        } else {
+            products.forEach { ElementView(it, onInteraction) }
+        }
+        others.forEach { ElementView(it, onInteraction) }
+        if (message.sources.isNotEmpty()) {
+            Text("Sources", style = MaterialTheme.typography.labelMedium)
+            message.sources.forEachIndexed { i, source ->
+                Text(
+                    text = "${source.citationNumber ?: (i + 1)}. ${source.title}",
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.clickable { onInteraction(ConciergeInteraction.SourceClicked(source)) }
+                )
             }
-            others.forEach { ElementView(it, open) }
-            if (response.sources.isNotEmpty()) {
-                Text("Sources", style = MaterialTheme.typography.labelMedium)
-                response.sources.forEachIndexed { i, source ->
-                    Text(
-                        text = "${source.citationNumber ?: (i + 1)}. ${source.title}",
-                        color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.clickable { open(source.url) }
+        }
+        if (message.feedbackEnabled) {
+            Row {
+                ConciergeFeedback.Rating.values().forEach { rating ->
+                    val label = if (rating == ConciergeFeedback.Rating.POSITIVE) "👍" else "👎"
+                    TextButton(onClick = { onRate(rating) }, enabled = message.feedback == null) {
+                        Text(if (message.feedback == rating) "$label Sent" else label)
+                    }
+                }
+            }
+        }
+        if (showSuggestions && message.promptSuggestions.isNotEmpty()) {
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                message.promptSuggestions.forEach { suggestion ->
+                    SuggestionChip(
+                        onClick = { onInteraction(ConciergeInteraction.PromptSuggestionClicked(suggestion)) },
+                        label = { Text(suggestion) }
                     )
                 }
             }
-            if (!turn.pending && reply.state == ConversationState.COMPLETED && response.feedbackEligible) {
-                Row {
-                    FeedbackRating.values().forEach { rating ->
-                        val label = if (rating == FeedbackRating.THUMBS_UP) "👍" else "👎"
-                        TextButton(onClick = { onRate(rating) }, enabled = turn.rating == null) {
-                            Text(if (turn.rating == rating) "$label Sent" else label)
-                        }
-                    }
-                }
-            }
-            if (showSuggestions && !turn.pending && response.promptSuggestions.isNotEmpty()) {
-                Row(
-                    Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    response.promptSuggestions.forEach { suggestion ->
-                        SuggestionChip(onClick = { onSuggestion(suggestion) }, label = { Text(suggestion) })
-                    }
-                }
-            }
         }
-        turn.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     }
 }
 
+
 @Composable
-private fun ElementView(element: MultimodalElement, open: (String?) -> Unit) {
+private fun ElementView(element: ConciergeElement, onInteraction: (ConciergeInteraction) -> Unit) {
     when (element) {
-        is MultimodalElement.ProductCard -> ProductCardView(element, open, Modifier.width(CARD_WIDTH))
-        is MultimodalElement.CtaButton -> OutlinedButton(onClick = { open(element.url) }) { Text(element.text) }
-        is MultimodalElement.Custom ->
+        is ConciergeElement.ProductCard -> ProductCardView(element, onInteraction, Modifier.width(CARD_WIDTH))
+        is ConciergeElement.CtaButton -> OutlinedButton(
+            onClick = { onInteraction(ConciergeInteraction.CtaClicked(element.label, element.url)) }
+        ) { Text(element.label) }
+        is ConciergeElement.Custom ->
             Text("Custom element: ${element.rendererId}", style = MaterialTheme.typography.labelSmall)
-        is MultimodalElement.Unknown ->
+        is ConciergeElement.Unknown ->
             Text("Unsupported element: ${element.type ?: "untyped"}", style = MaterialTheme.typography.labelSmall)
     }
 }
@@ -343,7 +350,7 @@ private fun ElementView(element: MultimodalElement, open: (String?) -> Unit) {
  * extension's default paged carousel.
  */
 @Composable
-private fun ProductCarousel(cards: List<MultimodalElement.ProductCard>, open: (String?) -> Unit) {
+private fun ProductCarousel(cards: List<ConciergeElement.ProductCard>, onInteraction: (ConciergeInteraction) -> Unit) {
     val scroll = rememberScrollState()
     val scope = rememberCoroutineScope()
     val stride = with(LocalDensity.current) { (CARD_WIDTH + CARD_SPACING).roundToPx() }
@@ -355,10 +362,15 @@ private fun ProductCarousel(cards: List<MultimodalElement.ProductCard>, open: (S
         // IntrinsicSize.Max makes the row as tall as its tallest card, and fillMaxHeight stretches
         // the others to match.
         Row(
-            Modifier.fillMaxWidth().horizontalScroll(scroll).height(IntrinsicSize.Max),
+            Modifier
+                .fillMaxWidth()
+                .horizontalScroll(scroll)
+                .height(IntrinsicSize.Max),
             horizontalArrangement = Arrangement.spacedBy(CARD_SPACING)
         ) {
-            cards.forEach { ProductCardView(it, open, Modifier.width(CARD_WIDTH).fillMaxHeight()) }
+            cards.forEach { card ->
+                ProductCardView(card, onInteraction, Modifier.width(CARD_WIDTH).fillMaxHeight())
+            }
         }
         if (scroll.maxValue > 0) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -389,42 +401,113 @@ private fun ProductCarousel(cards: List<MultimodalElement.ProductCard>, open: (S
 }
 
 /**
+ * Two or more product cards as a catalog-style grid of compact tiles, two per row. Each row is as
+ * tall as its tallest tile, so prices and CTAs line up across the row.
+ */
+@Composable
+private fun ProductGrid(cards: List<ConciergeElement.ProductCard>, onInteraction: (ConciergeInteraction) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(CARD_SPACING)) {
+        cards.chunked(2).forEach { row ->
+            Row(
+                Modifier.fillMaxWidth().height(IntrinsicSize.Max),
+                horizontalArrangement = Arrangement.spacedBy(CARD_SPACING)
+            ) {
+                row.forEach { ProductTile(it, onInteraction, Modifier.weight(1f).fillMaxHeight()) }
+                // Keeps a lone last tile at half width.
+                if (row.size == 1) Spacer(Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+/**
+ * A compact grid tile: square image with an optional badge, name, price and was-price, then the
+ * primary CTA. Tapping the tile opens the product page.
+ */
+@Composable
+private fun ProductTile(
+    card: ConciergeElement.ProductCard,
+    onInteraction: (ConciergeInteraction) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    OutlinedCard(modifier.clickable { onInteraction(ConciergeInteraction.ProductCardClicked(card)) }) {
+        card.productImageUrl?.let { url ->
+            ProductImage(url, card, Modifier.fillMaxWidth().aspectRatio(1f))
+        }
+        Column(Modifier.fillMaxHeight().padding(8.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = card.productName ?: card.id,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            // Pushes the price and CTA to the bottom so they line up across a row.
+            Spacer(Modifier.weight(1f))
+            card.productPrice?.let { Text(it, style = MaterialTheme.typography.labelLarge) }
+            card.productWasPrice?.let {
+                Text(
+                    text = "was $it",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            card.primary?.takeIf { it.isUsable() }?.let { action ->
+                Button(
+                    onClick = { onInteraction(ConciergeInteraction.ProductActionClicked(card, action)) },
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp)
+                ) {
+                    Text(action.text.orEmpty(), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+    }
+}
+
+/** The product image with its badge, if any, in the bottom-left corner. */
+@Composable
+private fun ProductImage(url: String, card: ConciergeElement.ProductCard, modifier: Modifier) {
+    val placeholder = ColorPainter(MaterialTheme.colorScheme.surfaceVariant)
+    Box {
+        AsyncImage(
+            model = url,
+            contentDescription = card.productName,
+            modifier = modifier,
+            placeholder = placeholder,
+            error = placeholder,
+            contentScale = ContentScale.Crop,
+            onError = { Log.w(TAG, "Failed to load image: $url", it.result.throwable) }
+        )
+        card.productBadge?.let {
+            Text(
+                text = it,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .background(MaterialTheme.colorScheme.primary)
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                color = MaterialTheme.colorScheme.onPrimary,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+/**
  * A product card in the style of the extension's `productDetail` cards: image with an optional
  * badge, name, description, price and was-price, then primary (filled) and secondary (outlined)
  * CTAs.
  */
 @Composable
 private fun ProductCardView(
-    card: MultimodalElement.ProductCard,
-    open: (String?) -> Unit,
+    card: ConciergeElement.ProductCard,
+    onInteraction: (ConciergeInteraction) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    OutlinedCard(modifier.clickable { open(card.productPageUrl ?: card.primary?.url) }) {
+    OutlinedCard(modifier.clickable { onInteraction(ConciergeInteraction.ProductCardClicked(card)) }) {
         card.productImageUrl?.let { url ->
-            val placeholder = ColorPainter(MaterialTheme.colorScheme.surfaceVariant)
-            Box {
-                AsyncImage(
-                    model = url,
-                    contentDescription = card.productName,
-                    modifier = Modifier.fillMaxWidth().height(190.dp),
-                    placeholder = placeholder,
-                    error = placeholder,
-                    contentScale = ContentScale.Crop,
-                    onError = { Log.w(TAG, "Failed to load image: $url", it.result.throwable) }
-                )
-                card.productBadge?.let {
-                    Text(
-                        text = it,
-                        modifier = Modifier
-                            .align(Alignment.BottomStart)
-                            .background(MaterialTheme.colorScheme.primary)
-                            .padding(horizontal = 12.dp, vertical = 4.dp),
-                        color = MaterialTheme.colorScheme.onPrimary,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
+            ProductImage(url, card, Modifier.fillMaxWidth().height(190.dp))
         }
         Column(Modifier.fillMaxHeight().padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
@@ -460,13 +543,16 @@ private fun ProductCardView(
                     // Two CTAs share the row; a single CTA wraps its text.
                     val ctaModifier = if (primary != null && secondary != null) Modifier.weight(1f) else Modifier
                     val ctaPadding = PaddingValues(horizontal = 12.dp)
+                    val onAction = { action: ConciergeAction ->
+                        onInteraction(ConciergeInteraction.ProductActionClicked(card, action))
+                    }
                     primary?.let {
-                        Button(onClick = { open(it.url) }, modifier = ctaModifier, contentPadding = ctaPadding) {
+                        Button(onClick = { onAction(it) }, modifier = ctaModifier, contentPadding = ctaPadding) {
                             Text(it.text.orEmpty(), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                     secondary?.let {
-                        OutlinedButton(onClick = { open(it.url) }, modifier = ctaModifier, contentPadding = ctaPadding) {
+                        OutlinedButton(onClick = { onAction(it) }, modifier = ctaModifier, contentPadding = ctaPadding) {
                             Text(it.text.orEmpty(), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
@@ -477,4 +563,4 @@ private fun ProductCardView(
 }
 
 /** Like the extension, a CTA needs both a label and a URL. */
-private fun ElementAction.isUsable() = !text.isNullOrBlank() && !url.isNullOrBlank()
+private fun ConciergeAction.isUsable() = !text.isNullOrBlank() && !url.isNullOrBlank()

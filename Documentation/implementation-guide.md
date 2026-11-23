@@ -201,9 +201,11 @@ of chat. The SDK forwards the data to the Brand Concierge agent pipeline and ren
 through the active chat transcript without requiring the user to type or say a chat message.
 
 > **Prerequisite:** Keep a configured `ConciergeChat` or `ConciergeChatView` rendered with a
-> non-empty `surfaces` list while calling this API. The active chat session provides both the
-> routing surfaces and the transcript that receives the service response. A handoff made without
-> an active chat session fails with `NO_ACTIVE_SESSION`.
+> non-empty `surfaces` list, or a [headless `ConciergeConversation`](headless.md#data-handoff)
+> open, while calling this API. The active chat session provides both the routing surfaces and the
+> transcript that receives the service response. If more than one is active, the most recently
+> opened one receives the handoff. A handoff made without an active chat session fails with
+> `NO_ACTIVE_SESSION`.
 
 ```kotlin
 import com.adobe.marketing.mobile.concierge.Concierge

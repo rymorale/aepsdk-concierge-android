@@ -1,0 +1,430 @@
+/*
+ * Copyright 2026 Adobe. All rights reserved.
+ * This file is licensed to you under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License. You may obtain a copy
+ * of the License at http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed under
+ * the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR REPRESENTATIONS
+ * OF ANY KIND, either express or implied. See the License for the specific language
+ * governing permissions and limitations under the License.
+ */
+
+package com.adobe.marketing.mobile.concierge
+
+import com.adobe.marketing.mobile.Event
+import com.adobe.marketing.mobile.concierge.network.ConversationService
+import com.adobe.marketing.mobile.concierge.network.ConversationState
+import com.adobe.marketing.mobile.concierge.network.CtaButton
+import com.adobe.marketing.mobile.concierge.network.MultimodalElement
+import com.adobe.marketing.mobile.concierge.network.ParsedConversationMessage
+import com.adobe.marketing.mobile.concierge.network.ParsedMultimodalItem
+import com.adobe.marketing.mobile.concierge.network.RawMultimodalElement
+import com.adobe.marketing.mobile.concierge.ui.state.Feedback
+import com.adobe.marketing.mobile.concierge.ui.state.FeedbackType
+import com.adobe.marketing.mobile.services.ServiceProvider
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.mockkStatic
+import io.mockk.unmockkStatic
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.runTest
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class ConciergeConversationTest {
+
+    private val keys = ConciergeConstants.TrackingEvent.EventData.Key
+    private val names = ConciergeConstants.TrackingEvent.Name
+    private val dispatched = mutableListOf<Event>()
+    private val service = FakeService()
+    private lateinit var sessionManager: ConciergeSessionManager
+    private lateinit var repository: ConciergeStateRepository
+    private val conversations = mutableListOf<ConciergeConversation>()
+    private val handoffResults = mutableListOf<DataHandoffDeliveryResult>()
+
+    @Before
+    fun setUp() {
+        mockkStatic(ServiceProvider::class)
+        every { ServiceProvider.getInstance() } returns mockk(relaxed = true)
+        sessionManager = mockk(relaxed = true)
+        every { sessionManager.getSessionId() } returns "session-1"
+        repository = ConciergeStateRepository(
+            sessionManager = sessionManager,
+            resetWarningScope = CoroutineScope(StandardTestDispatcher())
+        )
+    }
+
+    @After
+    fun tearDown() {
+        conversations.forEach { it.close() }
+        unmockkStatic(ServiceProvider::class)
+    }
+
+    @Test
+    fun `send streams the response and maps every element type`() = runTest {
+        val responses = Channel<ParsedConversationMessage>(Channel.UNLIMITED)
+        service.responses = responses.receiveAsFlow()
+        val conversation = conversation()
+
+        conversation.send("  running shoes  ")
+        assertEquals(ConciergeConversationState.RESPONDING, conversation.state.value)
+        assertEquals("running shoes", conversation.messages.value.single().text)
+
+        responses.send(inProgress("Here are"))
+        val streaming = conversation.messages.value.last()
+        assertEquals(ConciergeMessage.Role.AGENT, streaming.role)
+        assertEquals("Here are", streaming.text)
+        assertTrue(streaming.isStreaming)
+
+        responses.send(
+            completed(
+                "Here are some shoes.",
+                listOf(productElement(), ctaElement(), customElement(), unknownElement())
+            )
+        )
+        responses.close()
+
+        val reply = conversation.messages.value.last()
+        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+        assertEquals("Here are some shoes.", reply.text)
+        assertFalse(reply.isStreaming)
+        assertEquals(listOf("More like this"), reply.promptSuggestions)
+        assertEquals(listOf(ConciergeSource("Guide", "https://example.com/guide", 1)), reply.sources)
+
+        val card = reply.elements[0] as ConciergeElement.ProductCard
+        assertEquals("Runner", card.productName)
+        assertEquals("https://example.com/runner.jpg", card.productImageUrl)
+        assertEquals("https://example.com/runner", card.productPageUrl)
+        assertEquals(ConciergeAction("Buy", "https://example.com/buy"), card.primary)
+        assertNull(card.secondary)
+        assertEquals(ConciergeElement.CtaButton("Shop all", "https://example.com/all", mapOf("type" to "cta")), reply.elements[1])
+        assertEquals("store-map", (reply.elements[2] as ConciergeElement.Custom).rendererId)
+        assertEquals("video", (reply.elements[3] as ConciergeElement.Unknown).type)
+
+        assertEquals(
+            listOf(names.SESSION_INITIALIZED, names.QUERY_SUBMITTED, names.RESPONSE_STARTED, names.RESPONSE_COMPLETED),
+            dispatched.map { it.name }
+        )
+        assertEquals("running shoes", dispatched[1].eventData[keys.QUERY])
+        assertEquals("conv-1", dispatched[3].eventData[keys.CONVERSATION_ID])
+        assertEquals("interaction-1", dispatched[3].eventData[keys.INTERACTION_ID])
+    }
+
+    @Test
+    fun `an error response removes the agent message and reports the error`() = runTest {
+        service.responses = flowOf(inProgress("Partial"), message("Server unavailable", ConversationState.ERROR))
+        val conversation = conversation()
+
+        conversation.send("hello")
+
+        assertEquals(ConciergeConversationState.FAILED, conversation.state.value)
+        assertEquals(listOf(ConciergeMessage.Role.USER), conversation.messages.value.map { it.role })
+        val error = dispatched.single { it.name == names.ERROR_OCCURRED }
+        assertEquals("Conversation error: Server unavailable", error.eventData[keys.ERROR_MESSAGE])
+    }
+
+    @Test
+    fun `a response with no content fails`() = runTest {
+        service.responses = emptyFlow()
+        val conversation = conversation()
+
+        conversation.send("hello")
+
+        assertEquals(ConciergeConversationState.FAILED, conversation.state.value)
+        assertEquals(1, conversation.messages.value.size)
+    }
+
+    @Test
+    fun `cancel keeps partial text and a new message can be sent`() = runTest {
+        val responses = Channel<ParsedConversationMessage>(Channel.UNLIMITED)
+        service.responses = responses.receiveAsFlow()
+        val conversation = conversation()
+        conversation.send("hello")
+        responses.send(inProgress("Partial"))
+
+        conversation.send("ignored while responding")
+        assertEquals(2, conversation.messages.value.size)
+
+        conversation.cancel()
+
+        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+        val partial = conversation.messages.value.last()
+        assertEquals("Partial", partial.text)
+        assertFalse(partial.isStreaming)
+
+        service.responses = flowOf(completed("Done"))
+        conversation.send("again")
+        assertEquals("Done", conversation.messages.value.last().text)
+    }
+
+    @Test
+    fun `sendFeedback rates the message and sends it to the service`() = runTest {
+        service.responses = flowOf(completed("Answer", feedbackEligible = true))
+        val conversation = conversation()
+        conversation.send("hello")
+        val reply = conversation.messages.value.last()
+        assertTrue(reply.feedbackEnabled)
+
+        conversation.sendFeedback(reply.id, ConciergeFeedback(ConciergeFeedback.Rating.POSITIVE, listOf("Helpful"), "Great"))
+
+        assertEquals(ConciergeFeedback.Rating.POSITIVE, conversation.messages.value.last().feedback)
+        assertEquals(
+            Feedback("interaction-1", FeedbackType.POSITIVE, listOf("Helpful"), "Great", "conv-1"),
+            service.feedback.single()
+        )
+        val event = dispatched.single { it.name == names.FEEDBACK_SUBMITTED }
+        assertEquals(ConciergeConstants.ChatInteraction.POSITIVE, event.eventData[keys.FEEDBACK_TYPE])
+    }
+
+    @Test
+    fun `feedback is disabled when the response has CTA buttons`() = runTest {
+        service.responses = flowOf(completed("Answer", listOf(ctaElement()), feedbackEligible = true))
+        val conversation = conversation()
+        conversation.send("hello")
+        val reply = conversation.messages.value.last()
+
+        conversation.sendFeedback(reply.id, ConciergeFeedback(ConciergeFeedback.Rating.NEGATIVE))
+
+        assertFalse(reply.feedbackEnabled)
+        assertTrue(service.feedback.isEmpty())
+        assertTrue(dispatched.none { it.name == names.FEEDBACK_SUBMITTED })
+    }
+
+    @Test
+    fun `an identity reset clears the conversation and acknowledges the teardown`() = runTest {
+        val responses = Channel<ParsedConversationMessage>(Channel.UNLIMITED)
+        service.responses = responses.receiveAsFlow()
+        val conversation = conversation()
+        conversation.send("hello")
+        responses.send(inProgress("Partial"))
+        val resetEvents = mutableListOf<Event>()
+
+        repository.beginIdentityReset(mockk(relaxed = true)) { resetEvents.add(it) }
+
+        assertTrue(conversation.messages.value.isEmpty())
+        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+        val ended = resetEvents.single { it.name == names.CONVERSATION_ENDED }
+        assertEquals("conv-1", ended.eventData[keys.CONVERSATION_ID])
+        assertEquals(true, ended.eventData[keys.HAD_ACTIVE_TURN])
+
+        conversation.send("blocked until the reset completes")
+        assertTrue(conversation.messages.value.isEmpty())
+    }
+
+    @Test
+    fun `track reports the same events as the built-in UI`() = runTest {
+        val conversation = conversation()
+        val card = ConciergeElement.ProductCard(
+            id = "p1", productName = "Runner", productPageUrl = "https://example.com/runner"
+        )
+
+        conversation.track(ConciergeInteraction.CtaClicked("Shop all", "https://example.com/all"))
+        conversation.track(ConciergeInteraction.ProductActionClicked(card, ConciergeAction("Buy", "https://example.com/buy")))
+        conversation.track(ConciergeInteraction.LinkClicked(""))
+
+        val events = dispatched.drop(1)
+        assertEquals(
+            listOf(names.CTA_BUTTON_CLICKED, names.LINK_CLICKED, names.CARD_CLICKED, names.LINK_CLICKED),
+            events.map { it.name }
+        )
+        assertEquals("cta", events[1].eventData[keys.ORIGIN])
+        assertEquals(
+            mapOf("productName" to "Runner", "productPageURL" to "https://example.com/buy"),
+            events[2].eventData[keys.ELEMENT]
+        )
+        assertEquals("productCard", events[3].eventData[keys.ORIGIN])
+    }
+
+    @Test
+    fun `close stops the response and ignores later messages`() = runTest {
+        val responses = Channel<ParsedConversationMessage>(Channel.UNLIMITED)
+        service.responses = responses.receiveAsFlow()
+        val conversation = conversation()
+        conversation.send("hello")
+        responses.send(inProgress("Partial"))
+
+        conversation.close()
+        conversation.send("ignored")
+        conversation.close()
+
+        assertEquals(ConciergeConversationState.CLOSED, conversation.state.value)
+        assertEquals(listOf("hello", "Partial"), conversation.messages.value.map { it.text })
+        assertFalse(conversation.messages.value.last().isStreaming)
+        assertEquals(1, service.cleanups)
+    }
+
+    @Test
+    fun `a data handoff shows the local message and streams the response`() = runTest {
+        every { sessionManager.currentSessionIdOrNull() } returns "session-1"
+        repository.updateXDMContext(mapOf("fan" to mapOf("seat" to "A1")))
+        service.handoffResponses = flowOf(inProgress("Thanks"), completed("Thanks for your order"))
+        val conversation = conversation()
+
+        handoff(localMessage = "Order placed")
+
+        assertEquals(listOf(DataHandoffDeliveryResult.Delivered), handoffResults)
+        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+        assertEquals(
+            listOf(ConciergeMessage.Role.AGENT to "Order placed", ConciergeMessage.Role.AGENT to "Thanks for your order"),
+            conversation.messages.value.map { it.role to it.text }
+        )
+        assertEquals("successful-checkout", service.handoffRoutingHint)
+        assertEquals(mapOf("seat" to "A1"), service.handoffXdmFields?.get("fan"))
+        assertEquals(mapOf("orderId" to "1"), service.handoffXdmFields?.get("commerce"))
+    }
+
+    @Test
+    fun `a data handoff is rejected while responding and after close`() = runTest {
+        service.responses = Channel<ParsedConversationMessage>().receiveAsFlow()
+        val conversation = conversation()
+        conversation.send("hello")
+
+        handoff()
+        conversation.close()
+        handoff()
+
+        assertEquals(
+            listOf(
+                DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.CHAT_IN_PROGRESS),
+                DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.NO_ACTIVE_SESSION)
+            ),
+            handoffResults
+        )
+    }
+
+    @Test
+    fun `a data handoff with no first response times out and keeps the local message`() = runTest {
+        service.handoffResponses = Channel<ParsedConversationMessage>().receiveAsFlow()
+        val conversation = conversation()
+
+        handoff(localMessage = "Order placed")
+        assertTrue(handoffResults.isEmpty())
+        testScheduler.advanceTimeBy(ConciergeConstants.DataHandoff.FIRST_CHUNK_TIMEOUT_MS + 1)
+
+        assertEquals(
+            listOf(DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.DELIVERY_TIMEOUT)),
+            handoffResults
+        )
+        assertEquals(ConciergeConversationState.FAILED, conversation.state.value)
+        assertEquals(listOf("Order placed"), conversation.messages.value.map { it.text })
+    }
+
+    @Test
+    fun `an empty or cancelled data handoff reports a failure`() = runTest {
+        val conversation = conversation()
+        handoff()
+
+        service.handoffResponses = Channel<ParsedConversationMessage>().receiveAsFlow()
+        handoff()
+        conversation.cancel()
+
+        assertEquals(
+            listOf(
+                DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.EMPTY_RESPONSE),
+                DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.DELIVERY_FAILED, "Cancelled by the app")
+            ),
+            handoffResults
+        )
+        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+    }
+
+    private fun handoff(localMessage: String? = null) {
+        ActiveConciergeDataHandoffForwarder.forward(
+            ConciergeDataHandoffEvent("successful-checkout", mapOf("commerce" to mapOf("orderId" to "1")), localMessage)
+        ) { handoffResults.add(it) }
+    }
+
+    private fun TestScope.conversation(): ConciergeConversation {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        return ConciergeConversation(
+            stateRepository = repository,
+            sessionManager = sessionManager,
+            service = service,
+            dispatcher = dispatcher,
+            sessionDispatcher = dispatcher,
+            dispatch = { dispatched.add(it) },
+            currentTimeMillis = { 1_000L }
+        ).also { conversations.add(it) }
+    }
+
+    private fun message(text: String, state: ConversationState) = ParsedConversationMessage(
+        messageContent = text,
+        state = state,
+        conversationId = "conv-1",
+        interactionId = "interaction-1"
+    )
+
+    private fun inProgress(text: String) = message(text, ConversationState.IN_PROGRESS)
+
+    private fun completed(
+        text: String,
+        elements: List<RawMultimodalElement> = emptyList(),
+        feedbackEligible: Boolean = false
+    ) = message(text, ConversationState.COMPLETED).copy(
+        rawElements = elements,
+        orderedElements = elements.mapNotNull { it.parsedBuiltIn },
+        promptSuggestions = listOf("More like this"),
+        sources = listOf(com.adobe.marketing.mobile.concierge.network.Citation("Guide", "https://example.com/guide", 1)),
+        feedbackEligible = feedbackEligible
+    )
+
+    private fun productElement(): RawMultimodalElement {
+        val content = mapOf(
+            "productName" to "Runner",
+            "productImageURL" to "https://example.com/runner.jpg",
+            "productPageURL" to "https://example.com/runner",
+            "primaryText" to "Buy",
+            "primaryUrl" to "https://example.com/buy"
+        )
+        return RawMultimodalElement(
+            0, "product", null, mapOf("type" to "product"),
+            ParsedMultimodalItem.Card(MultimodalElement("p1", content = content))
+        )
+    }
+
+    private fun ctaElement() = RawMultimodalElement(
+        1, "cta", null, mapOf("type" to "cta"),
+        ParsedMultimodalItem.Cta(CtaButton("Shop all", "https://example.com/all"))
+    )
+
+    private fun customElement() =
+        RawMultimodalElement(2, "custom", "store-map", mapOf("type" to "custom"), null)
+
+    private fun unknownElement() = RawMultimodalElement(3, "video", null, mapOf("type" to "video"), null)
+
+    private class FakeService : ConversationService {
+        var responses: Flow<ParsedConversationMessage> = emptyFlow()
+        var handoffResponses: Flow<ParsedConversationMessage> = emptyFlow()
+        var handoffRoutingHint: String? = null
+        var handoffXdmFields: Map<String, Any>? = null
+        val feedback = mutableListOf<Feedback>()
+        var cleanups = 0
+
+        override fun chat(message: String, xdmFields: Map<String, Any>, sessionId: String?) = responses
+        override fun sendDataHandoff(routingHint: String, xdmFields: Map<String, Any>, sessionId: String?): Flow<ParsedConversationMessage> {
+            handoffRoutingHint = routingHint
+            handoffXdmFields = xdmFields
+            return handoffResponses
+        }
+        override suspend fun sendFeedback(feedback: Feedback): Boolean = this.feedback.add(feedback)
+        override fun cleanup() {
+            cleanups++
+        }
+    }
+}

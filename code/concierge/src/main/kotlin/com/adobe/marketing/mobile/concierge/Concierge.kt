@@ -15,6 +15,7 @@ import com.adobe.marketing.mobile.Extension
 import com.adobe.marketing.mobile.concierge.cards.ConciergeCardRenderers
 import com.adobe.marketing.mobile.concierge.ui.chat.ConciergeChat
 import com.adobe.marketing.mobile.concierge.ui.chat.ConciergeChatView
+import com.adobe.marketing.mobile.services.Log
 
 /** Public class containing APIs for the Brand Concierge extension. */
 object Concierge {
@@ -26,6 +27,25 @@ object Concierge {
     /** Returns the version of the Brand Concierge extension. */
     @JvmStatic
     fun extensionVersion(): String = ConciergeConstants.VERSION
+
+    /**
+     * Starts a conversation with no UI, for apps that draw the chat themselves. See
+     * [ConciergeConversation].
+     *
+     * Call on the main thread, after the extension is registered and configured. [surfaces] are
+     * shared with the built-in chat UI: the last surfaces set, by either one, are used for every
+     * request.
+     *
+     * @param surfaces the surface URLs that identify the Brand Concierge experience.
+     */
+    @JvmStatic
+    fun conversation(surfaces: List<String>): ConciergeConversation {
+        if (surfaces.none { it.isNotBlank() }) {
+            Log.warning(ConciergeConstants.EXTENSION_NAME, "Concierge", "conversation() called without surfaces; requests will fail.")
+        }
+        ConciergeStateRepository.instance.setSurfaces(surfaces)
+        return ConciergeConversation()
+    }
 
     /**
      * Enables tracking of user interactions with the concierge chat interface. This allows the extension to collect data on user behavior and interactions, which can be used for analytics and improving the concierge experience.
@@ -104,9 +124,10 @@ object Concierge {
      * Hands data to the SDK to forward toward the Brand Concierge agent pipeline,
      * outside of normal user-typed chat.
      *
-     * Keep a configured [ConciergeChat] or [ConciergeChatView] rendered while calling this API.
-     * The active chat session provides both routing surfaces and the transcript that renders the
-     * handoff response.
+     * Keep a configured [ConciergeChat] or [ConciergeChatView] rendered, or a [ConciergeConversation]
+     * open, while calling this API. The active chat session provides both routing surfaces and the
+     * transcript that renders the handoff response. If more than one is active, the most recently
+     * opened one receives the handoff.
      *
      * @param routingHint a keyword the end user never sees, consumed by Brand Concierge's
      * phrase-based router (e.g. "successful-checkout"). Defaults to an empty string, which

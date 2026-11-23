@@ -1,143 +1,162 @@
-# Headless conversation client
+# Headless conversations
 
-The `concierge-headless` module is a small Kotlin client for the Brand Concierge conversation API. Use it when the app draws its own chat UI. It has no AEP SDK dependency and no UI. Its request, response and event types mirror the published conversation API.
+`Concierge.conversation()` starts a Brand Concierge conversation with no UI. Use it when the app draws its own chat. The conversation sends messages, streams responses, sends feedback and reports analytics. The app draws every message and decides what each tap does.
 
-The app owns everything that the extension would otherwise manage:
+A headless conversation is part of the Brand Concierge extension. It uses the same setup as the built-in chat UI and shares its state:
 
-- The Edge Network server, datastream ID and optional region.
-- The session ID. Reuse it for every turn of one conversation.
-- The XDM identity map, for example the ECID from Edge Identity.
-- The consent state.
-- Any auth token.
+- The configuration, and the session ID.
+- Identities from Edge Identity, and consent.
+- The auth token from `Concierge.setAuthTokenProvider`.
+- The XDM context from `Concierge.updateXDMContext`.
+- Analytics settings from `Concierge.setEdgeTrackingEnabled`.
 
-The module is not published yet. Inside this repository, depend on it with `implementation(project(":concierge-headless"))`.
+Set up the extension as described in the [Implementation Guide](implementation-guide.md#configuration). No other dependency is needed.
 
-## Usage
+## Start a conversation
 
 ```kotlin
-val client = ConciergeClient(ConciergeConfig(server = "edge.adobedc.net", datastreamId = "<datastream ID>"))
+class ChatViewModel : ViewModel() {
+    val conversation = Concierge.conversation(listOf("web://example.com/index.html"))
 
-val request = ConversationRequest(
-    sessionId = sessionId,
-    surfaces = listOf("web://example.com/index.html"),
-    identityMap = mapOf("ECID" to listOf(mapOf("id" to ecid, "primary" to true))),
-    consent = Consent.IN,
-    message = "What running shoes do you have?"
-)
+    init {
+        conversation.track(ConciergeInteraction.Opened)
+    }
 
-scope.launch {
-    try {
-        client.converse(request).accumulate().collect { event ->
-            render(event.response)
-        }
-    } catch (e: ConciergeException) {
-        showError(e.message)
+    override fun onCleared() {
+        conversation.track(ConciergeInteraction.Closed)
+        conversation.close()
     }
 }
 ```
 
-`converse` returns a cold `Flow<ConversationEvent>`. Each collection sends one request. The flow completes after the first `COMPLETED` or `ERROR` event, or when the stream ends. Network work runs on `Dispatchers.IO`.
+`Concierge.conversation(surfaces)` returns a `ConciergeConversation`. Create it and call its methods on the main thread. Call `close()` when you no longer need it. After `close()`, the conversation ignores new messages.
 
-`accumulate()` turns the raw events into snapshots that each carry the full text so far:
+The surfaces are shared with the built-in chat UI. If both set surfaces, the last ones set are used for every request.
 
-- In-progress text is appended. A snapshot is emitted once there is visible text.
-- A `COMPLETED` event that has text or elements replaces the streamed text. Otherwise it is emitted with the streamed text.
-- An `ERROR` event throws `ConciergeException`.
-
-Without `accumulate()`, an `IN_PROGRESS` event's `response.message` holds only the newly streamed text.
-
-### Feedback
-
-When `response.feedbackEligible` is true, rate the response with its `interactionId` and `conversationId`:
+## Send messages
 
 ```kotlin
-client.sendFeedback(
-    FeedbackRequest(sessionId, identityMap, Consent.IN, event.interactionId!!, event.conversationId, FeedbackRating.THUMBS_UP)
-)
+conversation.send("What running shoes do you have?")
 ```
 
-### Data handoff
+`send` adds a user message, then streams the agent's reply. Collect `messages` and `state` to draw the chat:
 
-To send application data without a chat message, leave `message` empty and pass XDM fields in `xdm`. They are merged into the event's `xdm`. Pass the identity map through `identityMap`, not `xdm`.
-
-## Errors and cancellation
-
-Every failure is a `ConciergeException`:
-
-| Failure | Message | `statusCode` |
-| --- | --- | --- |
-| Non-2xx response | `The service returned HTTP <code>: <body>` (up to 1,000 characters of body) | The HTTP status |
-| Connection failure | `Could not reach the Brand Concierge service.` | `null` |
-| Stream read failure | `The response stream failed.` | `null` |
-| `ERROR` event, through `accumulate()` | The event's message, or `The service returned an error.` | `null` |
-
-Cancelling the collecting coroutine closes the connection, even while a read is blocked.
-
-Invalid arguments throw `IllegalArgumentException` when the config or request is built. For example, a blank session ID, no surfaces, or neither a message nor XDM data.
-
-## Wire format
-
-Both calls `POST` to:
-
-```
-https://{server}/brand-concierge[/{region}]/conversations?configId={datastreamId}&sessionId={sessionId}&requestId={uuid}
+```kotlin
+val messages by conversation.messages.collectAsStateWithLifecycle()
+val state by conversation.state.collectAsStateWithLifecycle()
 ```
 
-A conversation request sends `Accept: text/event-stream` and reads the server-sent event stream. A feedback request sends JSON and ignores the response body.
+`messages` holds every `ConciergeMessage`, oldest first:
 
-### Conversation request
-
-| Field | Source |
+| Property | Meaning |
 | --- | --- |
-| `events[0].meta.consent.state` | `consent` (`in`, `out` or `pending`) |
-| `events[0].query.conversation.surfaces` | `surfaces` |
-| `events[0].query.conversation.message` | `message` |
-| `events[0].query.conversation.data` | `{ "type": "auth", "payload": { "token": authToken } }`, when `authToken` is set |
-| `events[0].xdm.identityMap` | `identityMap` |
-| `events[0].xdm.*` | `xdm` |
+| `id` | Identifies the message. Use it as a list key and for feedback. |
+| `role` | `USER` or `AGENT`. |
+| `text` | The message text, which can contain Markdown. While `isStreaming` is true, it holds the text received so far. |
+| `isStreaming` | True while the agent is still writing this message. |
+| `elements` | Product cards, CTA buttons and other elements, in response order. Set when the response completes. |
+| `sources` | Citations. `startIndex` and `endIndex` locate the cited text. |
+| `promptSuggestions` | Follow-up prompts the user can send. |
+| `feedbackEnabled` | True when the message can receive feedback. |
+| `feedback` | The rating sent for this message, or null. |
 
-### Feedback request
+`state` is one of:
 
-| Field | Source |
+| State | Meaning |
 | --- | --- |
-| `events[0].xdm.conversation.feedback.rating.classification` | `Thumbs Up` or `Thumbs Down` |
-| `events[0].xdm.conversation.feedback.rating.score` | `1` or `0` |
-| `events[0].xdm.conversation.feedback.rating.reasons` | `reasons` |
-| `events[0].xdm.conversation.feedback.raw` | `[{ "text": notes, "purpose": "user input" }]`, when `notes` is not blank |
-| `events[0].xdm.conversation.turnID` | `interactionId` |
-| `events[0].xdm.conversation.conversationID` | `conversationId`, when set |
-| `events[0].xdm.eventType` | `conversation.feedback` |
-| `events[0].xdm.implementationDetails.version` | `headless+<client version>` |
+| `IDLE` | Ready to send. |
+| `RESPONDING` | Waiting for or receiving a reply. Show a loading indicator until the agent message appears. |
+| `FAILED` | The last reply failed. Its agent message is removed and the user message stays. The user can send again. |
+| `CLOSED` | `close()` was called. |
 
-The body also carries `identityMap`, consent, a UTC `timestamp` and `placeContext` with the device's local time and offset.
+Only one reply runs at a time. `send` ignores a message while the state is `RESPONDING`; messages are not queued. Call `cancel()` to stop a reply. The text received so far stays in `messages`.
 
-### Response
+## Elements
 
-Only `handle` entries of type `brand-concierge:conversation` are read. Each entry in their `payload` becomes one `ConversationEvent`. In-progress payloads with no text are skipped.
+Each agent message's `elements` are `ConciergeElement` values:
 
-| `ConversationEvent` / `ConversationResponse` | Payload field |
+| Element | Contents |
 | --- | --- |
-| `state` | `state` (`in-progress`, `completed`, `error`) |
-| `conversationId` | `conversationId` |
-| `interactionId` | `interactionId` |
-| `message` | `response.message` |
-| `promptSuggestions` | `response.promptSuggestions` |
-| `multimodalElements` | `response.multimodalElements.elements` |
-| `sources` | `response.sources`. Entries need a `title` and `url`. |
-| `linkHints` | `response.linkHints`. Entries need a `kind` and `href`. |
-| `feedbackEligible` | `response.feedback.eligible` |
+| `ProductCard` | Product name, descriptions, page and image URLs, price, was-price, badge, and primary and secondary `ConciergeAction` buttons. |
+| `CtaButton` | A label and URL. |
+| `Custom` | A `custom` element with a `rendererId`, for your own renderer. |
+| `Unknown` | Any other element. |
 
-Elements are classified the same way as the extension does:
+Every element keeps the element exactly as received in `raw`, for fields the types do not model.
 
-- `ctaButton` with `entity_info.primary.text` and `url` is a `CtaButton`.
-- `custom` with a `rendererId` is a `Custom` element for an app-defined renderer.
-- Any other element with an `id` is a `ProductCard`. Card fields are read from `entity_info` first, then from the element.
-- Everything else is `Unknown`.
+## Feedback
 
-Every element keeps the original JSON in `raw`, for fields the types do not model.
+When `feedbackEnabled` is true, send the user's rating with the message ID:
+
+```kotlin
+conversation.sendFeedback(message.id, ConciergeFeedback(ConciergeFeedback.Rating.POSITIVE, categories = listOf("Helpful")))
+```
+
+The message's `feedback` changes to the rating. Like the built-in UI, a response is not eligible for feedback when it has CTA buttons.
+
+## Analytics
+
+The conversation reports its own events, such as a submitted query and a started or completed response. Report the user's taps with `track`. Each interaction sends the same events as the built-in UI:
+
+| Interaction | When |
+| --- | --- |
+| `Opened`, `Closed` | The chat is shown or hidden. `Closed` reports the time since `Opened`. |
+| `PromptSuggestionClicked` | A prompt suggestion is tapped. |
+| `CtaClicked` | A CTA button is tapped. |
+| `ProductCardClicked` | A product card is tapped. |
+| `ProductActionClicked` | A product card button is tapped. |
+| `SourceClicked` | A citation is tapped. |
+| `LinkClicked` | A link in the message text is tapped. |
+
+`track` only reports. Your app opens the link or sends the suggestion:
+
+```kotlin
+fun onInteraction(interaction: ConciergeInteraction) {
+    conversation.track(interaction)
+    when (interaction) {
+        is ConciergeInteraction.PromptSuggestionClicked -> conversation.send(interaction.suggestion)
+        is ConciergeInteraction.CtaClicked -> openLink(interaction.url)
+        is ConciergeInteraction.ProductCardClicked -> interaction.card.productPageUrl?.let(::openLink)
+        is ConciergeInteraction.ProductActionClicked -> interaction.action.url?.let(::openLink)
+        is ConciergeInteraction.SourceClicked -> openLink(interaction.source.url)
+        is ConciergeInteraction.LinkClicked -> openLink(interaction.url)
+        else -> Unit
+    }
+}
+```
+
+Events are forwarded to Edge only after `Concierge.setEdgeTrackingEnabled(true)`. Tracking is off by default.
+
+Links come from the service. Before opening one, check its scheme. See [Links](headless-styling.md#links).
+
+## Identity reset
+
+When identities are reset, the conversation clears its messages and stops any reply in progress, like the built-in UI. Messages sent before the extension is ready again are ignored.
+
+## Data handoff
+
+While a conversation is open, [`Concierge.sendDataHandoff`](implementation-guide.md#data-handoff) delivers to it. There is no separate headless API:
+
+```kotlin
+Concierge.sendDataHandoff(
+    routingHint = "successful-checkout",
+    xdmFields = mapOf("commerce" to mapOf("order" to mapOf("purchaseID" to orderId))),
+    localMessage = "Your order is confirmed!"
+) { accepted, rejectReason -> }
+```
+
+- `localMessage`, if set, is added to `messages` as an `AGENT` message, because the user didn't type it. The response then streams in like a reply to `send`, and `state` is `RESPONDING` until it finishes.
+- The handoff is rejected with `CHAT_IN_PROGRESS` while a reply is in progress, and with `NO_ACTIVE_SESSION` after `close` or during an identity reset.
+- If the handoff fails or times out, the response is removed, `localMessage` stays, and `state` is `FAILED`. `cancel` stops it and reports `DELIVERY_FAILED`.
+- Only one chat receives handoffs: the most recently opened conversation, `ConciergeChat` or `ConciergeChatView`.
+
+## Not yet supported
+
+- Link hints, which tag links in the text as phone or store links, are not in `ConciergeMessage`.
+- Messages are not queued or resent in the background.
 
 ## Sample
 
-The test app's **Headless Chat** screen (`HeadlessChatActivity`) is a complete example. It streams turns, renders product cards (images loaded with [Coil](https://coil-kt.github.io/coil/), several cards in a paged carousel), CTAs, sources and suggestions, sends feedback and starts new sessions.
+The test app's **Headless Chat** screen (`HeadlessChatActivity`) is a complete example. It streams replies, shows product cards in a paged carousel or a two-column grid with images loaded by [Coil](https://coil-kt.github.io/coil/), and shows CTAs, sources and suggestions. It also sends feedback, reports taps, stops replies and starts new chats. Tapping a product's primary CTA (for example **Buy now**) simulates a completed checkout and calls `Concierge.sendDataHandoff`, so the agent replies in the same chat.
 
 To style a headless chat without a theme JSON, see [Styling a headless UI](headless-styling.md).
