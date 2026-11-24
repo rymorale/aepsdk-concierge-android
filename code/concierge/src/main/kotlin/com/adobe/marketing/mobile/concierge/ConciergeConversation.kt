@@ -16,6 +16,7 @@ import com.adobe.marketing.mobile.Event
 import com.adobe.marketing.mobile.MobileCore
 import com.adobe.marketing.mobile.concierge.network.CUSTOM_ELEMENT_TYPE
 import com.adobe.marketing.mobile.concierge.network.ConciergeConversationServiceClient
+import com.adobe.marketing.mobile.concierge.network.ConciergeHttpStatusException
 import com.adobe.marketing.mobile.concierge.network.ConversationService
 import com.adobe.marketing.mobile.concierge.network.ConversationState
 import com.adobe.marketing.mobile.concierge.network.MultimodalElement
@@ -28,7 +29,6 @@ import com.adobe.marketing.mobile.concierge.ui.state.FeedbackType
 import com.adobe.marketing.mobile.services.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CompletableJob
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -41,70 +41,157 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Closeable
 import java.io.IOException
+import java.lang.ref.WeakReference
+import java.net.SocketTimeoutException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** The state of a [ConciergeConversation]. */
-enum class ConciergeConversationState {
+sealed class ConciergeConversationState {
     /** Ready to send a message. */
-    IDLE,
+    object Idle : ConciergeConversationState() {
+        override fun toString() = "Idle"
+    }
 
     /** Waiting for or receiving an agent response. */
-    RESPONDING,
+    object Responding : ConciergeConversationState() {
+        override fun toString() = "Responding"
+    }
 
-    /** The last response failed. The conversation can still send messages. */
-    FAILED,
+    /**
+     * The last response failed with [error]. The conversation can still send messages, or
+     * [ConciergeConversation.retry] the failed one.
+     */
+    data class Failed(val error: ConciergeError) : ConciergeConversationState()
 
-    /** [ConciergeConversation.close] was called. */
-    CLOSED
+    /** The conversation ended for [reason] and sends nothing more. Create a new one. */
+    data class Closed(val reason: ConciergeCloseReason) : ConciergeConversationState()
+
+    /** True once the conversation is [Closed]. */
+    val isClosed: Boolean get() = this is Closed
 }
+
+/** Why a [ConciergeConversation] response failed. */
+enum class ConciergeError {
+    /** The service couldn't be reached, or the connection dropped. */
+    UNREACHABLE,
+
+    /** The request or the data handoff took too long. */
+    TIMEOUT,
+
+    /** The service returned an error, or a response with nothing to show. */
+    INVALID_RESPONSE_DATA,
+
+    /** Any other failure. */
+    UNKNOWN
+}
+
+/** Why a [ConciergeConversation] closed. */
+enum class ConciergeCloseReason {
+    /** The app called [ConciergeConversation.close]. */
+    CLOSED_BY_APP,
+
+    /** Another conversation was opened on the same surfaces. One conversation is open per set of surfaces. */
+    REPLACED,
+
+    /** The session expired after 30 minutes without a request, or another chat started a new one. */
+    SESSION_EXPIRED,
+
+    /** `MobileCore.resetIdentities()` was called. */
+    IDENTITY_RESET
+}
+
+/** The outcome of [ConciergeConversation.send] and [ConciergeConversation.retry]. */
+enum class ConciergeSendResult {
+    /** The message was sent. Its response streams into [ConciergeConversation.messages]. */
+    ACCEPTED,
+
+    /** The message was ignored because it is blank. */
+    BLANK,
+
+    /** The message was ignored because a response or data handoff is in progress. */
+    IN_PROGRESS,
+
+    /** The message was ignored because the conversation is closed. See [ConciergeConversationState.Closed]. */
+    CLOSED,
+
+    /** The message was ignored because an identity reset is in progress. Retry after it finishes. */
+    RESET_PENDING,
+
+    /** [ConciergeConversation.retry] was called, but the last response didn't fail or wasn't for a typed message. */
+    NOTHING_TO_RETRY
+}
+
+/**
+ * Thrown by [Concierge.conversation] when the extension isn't ready in time: the Brand Concierge
+ * configuration hasn't been received, there's no Experience Cloud ID yet, or an identity reset
+ * hasn't finished.
+ */
+class ConciergeConfigurationException internal constructor(message: String) : IllegalStateException(message)
 
 /**
  * A Brand Concierge conversation with no UI, for apps that draw the chat themselves. Create one
  * with [Concierge.conversation].
  *
  * The conversation sends messages, streams responses into [messages], sends feedback and reports
- * analytics events. It uses the same session, identity, consent, auth token and XDM context as the
+ * analytics events. It uses the same identity, consent, auth token and XDM context as the
  * built-in chat UI, and the settings on [Concierge] apply to both.
+ *
+ * One conversation is open per set of [surfaces]: opening another on the same surfaces closes this
+ * one with [ConciergeCloseReason.REPLACED]. The conversation runs on one session, [sessionId], for
+ * its whole life.
  *
  * While open, the conversation receives [Concierge.sendDataHandoff] requests, and their responses
  * stream into [messages]. Only one conversation or built-in chat receives handoffs at a time: the
- * most recently opened one.
+ * conversation most recently opened or sent a message, or the built-in chat most recently opened.
+ *
+ * Once [ConciergeConversationState.Closed] - by [close], replacement, session expiry or an identity
+ * reset - the conversation sends nothing more; create a new one.
  *
  * Call its methods on the main thread. Call [close] when the conversation is no longer needed,
  * for example in `ViewModel.onCleared`.
  */
 class ConciergeConversation internal constructor(
+    surfaces: List<String>,
+    /** The session this conversation runs on. It never changes. */
+    val sessionId: String,
     private val stateRepository: ConciergeStateRepository = ConciergeStateRepository.instance,
     private val sessionManager: ConciergeSessionManager = ConciergeSessionManager.instance,
-    private val service: ConversationService = ConciergeConversationServiceClient(stateRepository, sessionManager),
+    private val service: ConversationService =
+        ConciergeConversationServiceClient(stateRepository, sessionManager, surfaces = surfaces),
     dispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
-    private val sessionDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    // Null turns off the resend of a message interrupted while the app was in the background.
+    private val appInBackground: StateFlow<Boolean>? = null,
     private val dispatch: (Event) -> Unit = MobileCore::dispatchEvent,
     private val currentTimeMillis: () -> Long = System::currentTimeMillis
 ) : Closeable {
 
+    /** The surfaces this conversation was created with. */
+    val surfaces: List<String> = surfaces.toList()
+
     private val rootJob = SupervisorJob()
     private val scope = CoroutineScope(rootJob + dispatcher)
 
-    // Turns and feedback requests run under this job, so an identity reset can cancel them all.
-    private var conversationJob: CompletableJob = SupervisorJob(rootJob)
     private var turnJob: Job? = null
+    private var activeTurn: Turn? = null
     private val resetParticipant = Any()
     private var observedResetGeneration = stateRepository.state.value.resetGeneration
     private var conversationId: String? = null
     private val interactionIds = mutableMapOf<String, String>()
     private var openedAt: Long? = null
     private var handoff: DataHandoff? = null
+
+    // The typed message whose response failed last, for retry().
+    private var retryableQuery: String? = null
 
     private val handoffForwarder = object : ConciergeDataHandoffForwarder {
         // Called on the event hub thread.
@@ -117,7 +204,7 @@ class ConciergeConversation internal constructor(
     }
 
     private val _messages = MutableStateFlow<List<ConciergeMessage>>(emptyList())
-    private val _state = MutableStateFlow(ConciergeConversationState.IDLE)
+    private val _state = MutableStateFlow<ConciergeConversationState>(ConciergeConversationState.Idle)
 
     /** The messages in the conversation, oldest first. */
     val messages: StateFlow<List<ConciergeMessage>> = _messages.asStateFlow()
@@ -126,41 +213,97 @@ class ConciergeConversation internal constructor(
     val state: StateFlow<ConciergeConversationState> = _state.asStateFlow()
 
     init {
+        OpenConciergeConversations.open(this)?.close(ConciergeCloseReason.REPLACED)
         stateRepository.registerResetParticipant(resetParticipant)
         scope.launch { stateRepository.state.collect { observeIdentityReset(it) } }
-        ActiveConciergeDataHandoffForwarder.register(handoffForwarder)
+        appInBackground?.let { flow ->
+            scope.launch { flow.collect { inBackground -> if (inBackground) activeTurn?.overlappedBackground = true } }
+        }
+        ActiveConciergeDataHandoffForwarder.markUsed(handoffForwarder)
         report(ConciergeTrackingEvent.SessionInitialized)
     }
 
     /**
      * Sends [text] as a user message and streams the response into [messages].
      *
-     * The message is ignored if it is blank, while a response is in progress, while an identity
-     * reset is pending, or after [close].
+     * @return [ConciergeSendResult.ACCEPTED] if the message was sent, otherwise why it was
+     * ignored. Ignoring the result is safe.
      */
-    fun send(text: String) {
+    fun send(text: String): ConciergeSendResult {
         val message = text.trim()
-        if (message.isEmpty()) return
+        val result = if (message.isEmpty()) ConciergeSendResult.BLANK else admissionRefusal() ?: ConciergeSendResult.ACCEPTED
+        if (result != ConciergeSendResult.ACCEPTED) {
+            Log.warning(ConciergeConstants.EXTENSION_NAME, TAG, "Message ignored: $result.")
+            return result
+        }
+        _messages.update { it + ConciergeMessage(newId(), ConciergeMessage.Role.USER, message) }
+        startChatTurn(message)
+        return result
+    }
+
+    /**
+     * Sends the typed message whose response failed again, without adding it to [messages] again.
+     * Only valid while [state] is [ConciergeConversationState.Failed] after a typed message.
+     *
+     * @return [ConciergeSendResult.ACCEPTED] if the message was sent, otherwise why it wasn't.
+     */
+    fun retry(): ConciergeSendResult {
+        val query = retryableQuery
+        val result = admissionRefusal()
+            ?: if (_state.value is ConciergeConversationState.Failed && query != null) {
+                ConciergeSendResult.ACCEPTED
+            } else {
+                ConciergeSendResult.NOTHING_TO_RETRY
+            }
+        if (result != ConciergeSendResult.ACCEPTED || query == null) {
+            Log.warning(ConciergeConstants.EXTENSION_NAME, TAG, "Retry ignored: $result.")
+            return result
+        }
+        startChatTurn(query)
+        return result
+    }
+
+    /** Why a message or data handoff can't start now, or null if it can. */
+    private fun admissionRefusal(): ConciergeSendResult? {
         observeIdentityReset(stateRepository.state.value)
-        val rejection = when {
-            _state.value == ConciergeConversationState.CLOSED -> "the conversation is closed"
-            turnJob?.isActive == true -> "a response is in progress"
-            stateRepository.state.value.resetInProgress -> "an identity reset is pending"
+        if (!_state.value.isClosed && isSessionExpired()) close(ConciergeCloseReason.SESSION_EXPIRED)
+        return when {
+            _state.value.isClosed -> ConciergeSendResult.CLOSED
+            stateRepository.state.value.resetInProgress -> ConciergeSendResult.RESET_PENDING
+            turnJob?.isActive == true -> ConciergeSendResult.IN_PROGRESS
             else -> null
         }
-        if (rejection != null) {
-            Log.warning(ConciergeConstants.EXTENSION_NAME, TAG, "Message ignored because $rejection.")
-            return
-        }
+    }
 
-        val snapshot = stateRepository.captureXDMContext()
-        val turn = Turn(newId(), snapshot.generation)
-        _messages.update { it + ConciergeMessage(newId(), ConciergeMessage.Role.USER, message) }
-        _state.value = ConciergeConversationState.RESPONDING
-        turnJob = scope.launch(conversationJob) {
-            runTurn(turn, snapshot) { sessionId, xdmFields ->
-                report(ConciergeTrackingEvent.QuerySubmitted(message, xdmFields))
-                service.chat(message, xdmFields, sessionId)
+    private fun isSessionExpired() = sessionManager.currentSessionIdOrNull() != sessionId
+
+    /**
+     * Streams the response to [query]. If the response fails while the app is in the background,
+     * the message is sent once more when the app returns to the foreground.
+     */
+    private fun startChatTurn(query: String) {
+        retryableQuery = null
+        ActiveConciergeDataHandoffForwarder.markUsed(handoffForwarder)
+        _state.value = ConciergeConversationState.Responding
+        turnJob = scope.launch {
+            var allowsBackgroundResend = appInBackground != null
+            while (true) {
+                val snapshot = stateRepository.captureXDMContext()
+                val turn = Turn(newId(), snapshot.generation, query, allowsBackgroundResend)
+                turn.overlappedBackground = appInBackground?.value == true
+                activeTurn = turn
+                val outcome = runTurn(turn, snapshot) { sessionId, xdmFields ->
+                    report(ConciergeTrackingEvent.QuerySubmitted(query, xdmFields))
+                    service.chat(query, xdmFields, sessionId)
+                }
+                activeTurn = null
+                if (outcome != TurnOutcome.INTERRUPTED) break
+                appInBackground?.first { !it }
+                if (isSessionExpired()) {
+                    reportFailure(turn, turn.failure ?: "Response interrupted", turn.error)
+                    break
+                }
+                allowsBackgroundResend = false
             }
         }
     }
@@ -175,10 +318,11 @@ class ConciergeConversation internal constructor(
             DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.DELIVERY_FAILED, "Cancelled by the app")
         )
         turnJob = null
+        activeTurn = null
         job.cancel()
         stopStreaming()
-        if (_state.value == ConciergeConversationState.RESPONDING) {
-            _state.value = ConciergeConversationState.IDLE
+        if (_state.value == ConciergeConversationState.Responding) {
+            _state.value = ConciergeConversationState.Idle
         }
     }
 
@@ -191,7 +335,7 @@ class ConciergeConversation internal constructor(
         val repositoryState = stateRepository.state.value
         val interactionId = interactionIds[messageId]
         val rejection = when {
-            _state.value == ConciergeConversationState.CLOSED -> "the conversation is closed"
+            _state.value.isClosed -> "the conversation is closed"
             repositoryState.resetInProgress -> "an identity reset is pending"
             interactionId == null -> "message $messageId does not accept feedback"
             else -> null
@@ -222,7 +366,7 @@ class ConciergeConversation internal constructor(
         )
         val request = Feedback(interactionId, type, feedback.categories, feedback.notes, conversationId)
         val generation = repositoryState.resetGeneration
-        scope.launch(conversationJob) {
+        scope.launch {
             stateRepository.withConversation(generation) { }
             if (!service.sendFeedback(request, generation)) {
                 Log.warning(ConciergeConstants.EXTENSION_NAME, TAG, "Failed to send feedback for $messageId.")
@@ -235,8 +379,10 @@ class ConciergeConversation internal constructor(
      * built-in chat UI. Events reach Edge only when [Concierge.setEdgeTrackingEnabled] is on.
      *
      * Reporting doesn't act on the interaction: the app opens links and sends prompt suggestions.
+     * Interactions are ignored once the conversation is closed.
      */
     fun track(interaction: ConciergeInteraction) {
+        if (_state.value.isClosed) return
         val origin = ConciergeConstants.TrackingEvent.LinkClickOrigin
         when (interaction) {
             ConciergeInteraction.Opened -> {
@@ -278,38 +424,62 @@ class ConciergeConversation internal constructor(
             }
             is ConciergeInteraction.SourceClicked -> reportLink(interaction.source.url, origin.CITATION)
             is ConciergeInteraction.LinkClicked -> reportLink(interaction.url, origin.INLINE)
+            is ConciergeInteraction.LinkHintClicked -> reportLink(interaction.hint.href, origin.LINK_HINT)
         }
     }
 
     /**
      * Stops the response in progress and releases the conversation. After this, [state] is
-     * [ConciergeConversationState.CLOSED] and new messages are ignored. Calling it again does
-     * nothing.
+     * [ConciergeConversationState.Closed] with [ConciergeCloseReason.CLOSED_BY_APP] and new
+     * messages are ignored. Calling it again does nothing.
      */
-    override fun close() {
-        if (_state.value == ConciergeConversationState.CLOSED) return
+    override fun close() = close(ConciergeCloseReason.CLOSED_BY_APP)
+
+    internal fun close(reason: ConciergeCloseReason, resetGeneration: Long = stateRepository.state.value.resetGeneration) {
+        if (_state.value.isClosed) return
         val hadActiveTurn = turnJob?.isActive == true
         val hadConversation = _messages.value.isNotEmpty() || hadActiveTurn
+        val endedConversationId = conversationId
+        OpenConciergeConversations.closed(this)
         ActiveConciergeDataHandoffForwarder.unregister(handoffForwarder)
         rootJob.cancel()
         service.cleanup()
         stateRepository.acknowledgeIdentityReset(
-            resetParticipant, stateRepository.state.value.resetGeneration,
-            hadConversation, conversationId, hadActiveTurn
+            resetParticipant, resetGeneration, hadConversation, endedConversationId, hadActiveTurn
         )
         stateRepository.unregisterResetParticipant(resetParticipant)
-        stopStreaming()
-        _state.value = ConciergeConversationState.CLOSED
+        turnJob = null
+        activeTurn = null
+        retryableQuery = null
+        if (reason == ConciergeCloseReason.IDENTITY_RESET) {
+            _messages.value = emptyList()
+            interactionIds.clear()
+            conversationId = null
+        } else {
+            stopStreaming()
+        }
+        Log.debug(ConciergeConstants.EXTENSION_NAME, TAG, "Conversation closed: $reason.")
+        _state.value = ConciergeConversationState.Closed(reason)
     }
 
-    private class Turn(val agentMessageId: String, val generation: Long) {
+    /** One agent response. [query] is the typed message it answers, or null for a data handoff. */
+    private class Turn(
+        val agentMessageId: String,
+        val generation: Long,
+        val query: String? = null,
+        val allowsBackgroundResend: Boolean = false
+    ) {
         val text = StringBuilder()
         var interactionId: String? = null
         var responseStarted = false
         var completed = false
+        var overlappedBackground = false
+        var failure: String? = null
+        var error = ConciergeError.UNKNOWN
     }
 
-    private enum class TurnOutcome { DELIVERED, EMPTY, FAILED }
+    // INTERRUPTED: the response failed while the app was in the background and will be sent again.
+    private enum class TurnOutcome { DELIVERED, EMPTY, FAILED, INTERRUPTED }
 
     /** A [Concierge.sendDataHandoff] request whose [completion] runs exactly once. */
     private class DataHandoff(
@@ -326,27 +496,25 @@ class ConciergeConversation internal constructor(
     private class DataHandoffTimeoutException : Exception("Data handoff timed out")
 
     private fun startDataHandoff(request: DataHandoff) {
-        observeIdentityReset(stateRepository.state.value)
-        val rejection = when {
-            _state.value == ConciergeConversationState.CLOSED || stateRepository.state.value.resetInProgress ->
-                ConciergeDataHandoffRejectReason.NO_ACTIVE_SESSION
-            turnJob?.isActive == true -> ConciergeDataHandoffRejectReason.CHAT_IN_PROGRESS
-            else -> null
+        val rejection = when (admissionRefusal()) {
+            null -> null
+            ConciergeSendResult.IN_PROGRESS -> ConciergeDataHandoffRejectReason.CHAT_IN_PROGRESS
+            else -> ConciergeDataHandoffRejectReason.NO_ACTIVE_SESSION
         }
         if (rejection != null) {
             request.complete(DataHandoffDeliveryResult.Failed(rejection))
             return
         }
 
+        retryableQuery = null
         val snapshot = stateRepository.captureXDMContext()
         val turn = Turn(newId(), snapshot.generation)
-        // The local message is app-supplied copy, not something the user typed.
         request.event.localMessage?.let { text ->
-            _messages.update { it + ConciergeMessage(newId(), ConciergeMessage.Role.AGENT, text) }
+            _messages.update { it + ConciergeMessage(newId(), ConciergeMessage.Role.APP, text) }
         }
-        _state.value = ConciergeConversationState.RESPONDING
+        _state.value = ConciergeConversationState.Responding
         handoff = request
-        val job = scope.launch(conversationJob) { request.complete(runDataHandoff(turn, snapshot, request.event)) }
+        val job = scope.launch { request.complete(runDataHandoff(turn, snapshot, request.event)) }
         // Covers a close, an identity reset or a cancel before the handoff finished.
         job.invokeOnCompletion {
             request.complete(DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.NO_ACTIVE_SESSION))
@@ -391,11 +559,12 @@ class ConciergeConversation internal constructor(
             when (outcome) {
                 TurnOutcome.DELIVERED -> DataHandoffDeliveryResult.Delivered
                 TurnOutcome.EMPTY -> DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.EMPTY_RESPONSE)
-                TurnOutcome.FAILED -> DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.DELIVERY_FAILED)
+                TurnOutcome.FAILED, TurnOutcome.INTERRUPTED ->
+                    DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.DELIVERY_FAILED)
             }
         }
     } catch (e: DataHandoffTimeoutException) {
-        failTurn(turn, e.message ?: "Data handoff timed out")
+        failTurn(turn, e.message ?: "Data handoff timed out", ConciergeError.TIMEOUT)
         DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.DELIVERY_TIMEOUT)
     }
 
@@ -409,9 +578,6 @@ class ConciergeConversation internal constructor(
         request: (sessionId: String, xdmFields: Map<String, Any>) -> Flow<ParsedConversationMessage>
     ): TurnOutcome {
         try {
-            val sessionId = withContext(sessionDispatcher) {
-                stateRepository.withConversation(turn.generation) { sessionManager.getSessionId() }
-            }
             val responses = stateRepository.withConversation(turn.generation) {
                 request(sessionId, stateRepository.resolveXDMContext(snapshot, sessionId))
             }
@@ -426,20 +592,34 @@ class ConciergeConversation internal constructor(
                 }
                 .collect { onResponse(turn, it) }
             return when {
-                errorDetail != null -> failTurn(turn, errorDetail!!, TurnOutcome.FAILED)
+                errorDetail != null -> failTurn(turn, errorDetail!!, ConciergeError.INVALID_RESPONSE_DATA)
                 hasResponse(turn) -> finishTurn()
-                else -> failTurn(turn, "Conversation ended with no response content", TurnOutcome.EMPTY)
+                else -> failTurn(
+                    turn, "Conversation ended with no response content", ConciergeError.INVALID_RESPONSE_DATA,
+                    TurnOutcome.EMPTY
+                )
             }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            val error = e.toConciergeError()
             // A connection dropped after the full response arrived leaves nothing to recover.
-            return if (turn.completed && e is IOException && hasResponse(turn)) {
+            return if (turn.completed && (error == ConciergeError.UNREACHABLE || error == ConciergeError.TIMEOUT) &&
+                hasResponse(turn)
+            ) {
                 finishTurn()
             } else {
-                failTurn(turn, "Failed to process response: ${e.message}")
+                failTurn(turn, "Failed to process response: ${e.message}", error)
             }
         }
+    }
+
+    // An HTTP status error is a server rejection, not a dropped connection.
+    private fun Exception.toConciergeError() = when (this) {
+        is ConciergeHttpStatusException -> ConciergeError.INVALID_RESPONSE_DATA
+        is SocketTimeoutException -> ConciergeError.TIMEOUT
+        is IOException -> ConciergeError.UNREACHABLE
+        else -> ConciergeError.UNKNOWN
     }
 
     private fun onResponse(turn: Turn, response: ParsedConversationMessage) {
@@ -475,6 +655,7 @@ class ConciergeConversation internal constructor(
                     sources = response.sources.map {
                         ConciergeSource(it.title, it.url, it.citationNumber, it.startIndex, it.endIndex)
                     },
+                    linkHints = response.linkHints.map { ConciergeLinkHint(it.href, it.kind) },
                     promptSuggestions = response.promptSuggestions,
                     feedbackEnabled = feedbackEnabled
                 )
@@ -493,37 +674,42 @@ class ConciergeConversation internal constructor(
 
     private fun finishTurn(): TurnOutcome {
         stopStreaming()
-        _state.value = ConciergeConversationState.IDLE
+        _state.value = ConciergeConversationState.Idle
         return TurnOutcome.DELIVERED
     }
 
-    private fun failTurn(turn: Turn, detail: String, outcome: TurnOutcome = TurnOutcome.FAILED): TurnOutcome {
+    private fun failTurn(
+        turn: Turn,
+        detail: String,
+        error: ConciergeError,
+        outcome: TurnOutcome = TurnOutcome.FAILED
+    ): TurnOutcome {
         _messages.update { messages -> messages.filterNot { it.id == turn.agentMessageId } }
         interactionIds.remove(turn.agentMessageId)
-        Log.error(ConciergeConstants.EXTENSION_NAME, TAG, detail)
-        report(ConciergeTrackingEvent.ErrorOccurred(detail))
-        _state.value = ConciergeConversationState.FAILED
+        val interruptedInBackground = turn.allowsBackgroundResend && turn.overlappedBackground && !turn.completed &&
+            (error == ConciergeError.UNREACHABLE || error == ConciergeError.TIMEOUT)
+        if (interruptedInBackground) {
+            Log.debug(ConciergeConstants.EXTENSION_NAME, TAG, "$detail while in the background. Resending in the foreground.")
+            turn.failure = detail
+            turn.error = error
+            return TurnOutcome.INTERRUPTED
+        }
+        reportFailure(turn, detail, error)
         return outcome
     }
 
+    private fun reportFailure(turn: Turn, detail: String, error: ConciergeError) {
+        Log.error(ConciergeConstants.EXTENSION_NAME, TAG, detail)
+        report(ConciergeTrackingEvent.ErrorOccurred(detail))
+        retryableQuery = turn.query
+        _state.value = ConciergeConversationState.Failed(error)
+    }
+
+    // An identity reset ends the conversation: its messages belonged to the previous identity.
     private fun observeIdentityReset(state: ConciergeState) {
         if (state.resetGeneration == observedResetGeneration) return
         observedResetGeneration = state.resetGeneration
-        if (_state.value == ConciergeConversationState.CLOSED) return
-
-        val hadActiveTurn = turnJob?.isActive == true
-        val hadConversation = _messages.value.isNotEmpty() || hadActiveTurn
-        val endedConversationId = conversationId
-        conversationJob.cancel()
-        conversationJob = SupervisorJob(rootJob)
-        turnJob = null
-        _messages.value = emptyList()
-        interactionIds.clear()
-        conversationId = null
-        _state.value = ConciergeConversationState.IDLE
-        stateRepository.acknowledgeIdentityReset(
-            resetParticipant, state.resetGeneration, hadConversation, endedConversationId, hadActiveTurn
-        )
+        close(ConciergeCloseReason.IDENTITY_RESET, state.resetGeneration)
     }
 
     private fun upsert(message: ConciergeMessage) {
@@ -552,6 +738,22 @@ class ConciergeConversation internal constructor(
 
     private companion object {
         const val TAG = "ConciergeConversation"
+    }
+}
+
+/** The open [ConciergeConversation] for each set of surfaces. */
+internal object OpenConciergeConversations {
+    private val open = mutableMapOf<Set<String>, WeakReference<ConciergeConversation>>()
+
+    /** Records [conversation] as open, and returns the conversation it replaces, if any. */
+    @Synchronized
+    fun open(conversation: ConciergeConversation): ConciergeConversation? =
+        open.put(conversation.surfaces.toSet(), WeakReference(conversation))?.get()?.takeIf { it !== conversation }
+
+    @Synchronized
+    fun closed(conversation: ConciergeConversation) {
+        val key = conversation.surfaces.toSet()
+        if (open[key]?.get() === conversation) open.remove(key)
     }
 }
 

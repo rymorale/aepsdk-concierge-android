@@ -69,6 +69,15 @@ internal object ActiveConciergeDataHandoffForwarder : ConciergeDataHandoffForwar
         }
     }
 
+    /**
+     * Makes [forwarder] the handoff target without the replacement warning. Headless conversations
+     * call this when opened and on each message, so handoffs go to the one most recently opened or
+     * used.
+     */
+    internal fun markUsed(forwarder: ConciergeDataHandoffForwarder) {
+        synchronized(this) { activeForwarder = forwarder }
+    }
+
     internal fun unregister(forwarder: ConciergeDataHandoffForwarder) {
         synchronized(this) {
             if (activeForwarder === forwarder) {

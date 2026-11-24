@@ -23,6 +23,8 @@ package com.adobe.marketing.mobile.concierge
  * @property elements product cards, CTA buttons and other elements, in response order. They are
  * set when the response completes.
  * @property sources the citations for [text].
+ * @property linkHints links in [text] that the agent tagged with a kind, such as a phone or store
+ * link, so the app can mark them, for example with an icon.
  * @property promptSuggestions follow-up prompts the user can send.
  * @property feedbackEnabled true when the message can receive feedback.
  * @property feedback the rating sent for this message, or null if none was sent.
@@ -34,12 +36,19 @@ data class ConciergeMessage(
     val isStreaming: Boolean = false,
     val elements: List<ConciergeElement> = emptyList(),
     val sources: List<ConciergeSource> = emptyList(),
+    val linkHints: List<ConciergeLinkHint> = emptyList(),
     val promptSuggestions: List<String> = emptyList(),
     val feedbackEnabled: Boolean = false,
     val feedback: ConciergeFeedback.Rating? = null
 ) {
     /** Who wrote a [ConciergeMessage]. */
-    enum class Role { USER, AGENT }
+    enum class Role {
+        USER,
+        AGENT,
+
+        /** Text the app added to the conversation, such as a data handoff's `localMessage`. */
+        APP
+    }
 }
 
 /**
@@ -98,6 +107,12 @@ data class ConciergeSource(
 )
 
 /**
+ * A link in a message's text that the agent tagged with a [kind], such as `phone` or `store`.
+ * [href] matches the link's URL in the text.
+ */
+data class ConciergeLinkHint(val href: String, val kind: String)
+
+/**
  * Feedback on an agent message.
  *
  * @property rating whether the response was helpful.
@@ -144,4 +159,7 @@ sealed class ConciergeInteraction {
 
     /** A link in the message text was tapped. */
     data class LinkClicked(val url: String) : ConciergeInteraction()
+
+    /** A link with a [ConciergeLinkHint], or the app's marker for it, was tapped. */
+    data class LinkHintClicked(val hint: ConciergeLinkHint) : ConciergeInteraction()
 }

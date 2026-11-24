@@ -1385,6 +1385,17 @@ class ConciergeConversationServiceClientTest {
     }
 
     @Test
+    fun `chat request uses the client's own surfaces over the shared ones`() = runTest {
+        val requestSlot = slot<NetworkRequest>()
+        stubConnection(requestSlot)
+
+        ConciergeConversationServiceClient(mockStateRepository, mockSessionManager, surfaces = listOf("own"))
+            .chat("test").toList()
+
+        assertTrue(capturedBody(requestSlot).contains("\"surfaces\":[\"own\"]"))
+    }
+
+    @Test
     fun `chat request escapes quotes in message`() = runTest {
         val requestSlot = slot<NetworkRequest>()
         val connection = mockk<HttpConnecting>(relaxed = true)

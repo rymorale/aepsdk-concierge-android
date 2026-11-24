@@ -76,20 +76,25 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
 import coil.compose.AsyncImage
 import com.adobe.marketing.mobile.concierge.Concierge
 import com.adobe.marketing.mobile.concierge.ConciergeAction
+import com.adobe.marketing.mobile.concierge.ConciergeConfigurationException
 import com.adobe.marketing.mobile.concierge.ConciergeConversation
 import com.adobe.marketing.mobile.concierge.ConciergeConversationState
 import com.adobe.marketing.mobile.concierge.ConciergeElement
 import com.adobe.marketing.mobile.concierge.ConciergeFeedback
 import com.adobe.marketing.mobile.concierge.ConciergeInteraction
 import com.adobe.marketing.mobile.concierge.ConciergeMessage
+import com.adobe.marketing.mobile.concierge.ConciergeSendResult
 import com.adobe.marketing.mobile.conciergetestapp.theme.ConciergeAppTheme
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.util.UUID
 
@@ -126,13 +131,24 @@ class HeadlessChatActivity : ComponentActivity() {
 /** Keeps the conversation across configuration changes and closes it with the screen. */
 class HeadlessChatViewModel : ViewModel() {
 
-    var conversation by mutableStateOf(start())
+    /** Null while the conversation starts, or if it failed to start. */
+    var conversation by mutableStateOf<ConciergeConversation?>(null)
         private set
+
+    /** Why the conversation failed to start, or null. */
+    var error by mutableStateOf<String?>(null)
+        private set
+
+    private var startJob: Job? = null
+
+    init {
+        start()
+    }
 
     /** Replaces the conversation with an empty one. The Concierge session stays the same. */
     fun newChat() {
         end()
-        conversation = start()
+        start()
     }
 
     /**
@@ -158,17 +174,51 @@ class HeadlessChatViewModel : ViewModel() {
 
     override fun onCleared() = end()
 
-    private fun start() = Concierge.conversation(listOf(SURFACE)).also { it.track(ConciergeInteraction.Opened) }
+    private fun start() {
+        error = null
+        startJob = viewModelScope.launch {
+            try {
+                conversation = Concierge.conversation(listOf(SURFACE)).also { it.track(ConciergeInteraction.Opened) }
+            } catch (e: ConciergeConfigurationException) {
+                error = e.message
+            }
+        }
+    }
 
     private fun end() {
-        conversation.track(ConciergeInteraction.Closed)
-        conversation.close()
+        startJob?.cancel()
+        conversation?.let {
+            it.track(ConciergeInteraction.Closed)
+            it.close()
+        }
+        conversation = null
     }
 }
 
 @Composable
 private fun HeadlessChatScreen(viewModel: HeadlessChatViewModel) {
     val conversation = viewModel.conversation
+    if (conversation != null) {
+        ConversationScreen(viewModel, conversation)
+        return
+    }
+    Column(
+        Modifier.fillMaxSize().safeDrawingPadding().padding(16.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        val error = viewModel.error
+        if (error == null) {
+            Text("Starting…")
+        } else {
+            Text(error, color = MaterialTheme.colorScheme.error)
+            TextButton(onClick = viewModel::newChat) { Text("Retry") }
+        }
+    }
+}
+
+@Composable
+private fun ConversationScreen(viewModel: HeadlessChatViewModel, conversation: ConciergeConversation) {
     val messages by conversation.messages.collectAsStateWithLifecycle()
     val state by conversation.state.collectAsStateWithLifecycle()
     var input by rememberSaveable { mutableStateOf("") }
@@ -189,6 +239,7 @@ private fun HeadlessChatScreen(viewModel: HeadlessChatViewModel) {
                 if (interaction.action == interaction.card.primary) viewModel.buy(interaction.card) else open(interaction.action.url)
             is ConciergeInteraction.SourceClicked -> open(interaction.source.url)
             is ConciergeInteraction.LinkClicked -> open(interaction.url)
+            is ConciergeInteraction.LinkHintClicked -> open(interaction.hint.href)
             else -> Unit
         }
     }
@@ -225,17 +276,29 @@ private fun HeadlessChatScreen(viewModel: HeadlessChatViewModel) {
             items(messages, key = { it.id }) { message ->
                 MessageView(
                     message = message,
-                    showSuggestions = message.id == messages.last().id && state == ConciergeConversationState.IDLE,
+                    showSuggestions = message.id == messages.last().id && state == ConciergeConversationState.Idle,
                     grid = grid,
                     onInteraction = onInteraction,
                     onRate = { conversation.sendFeedback(message.id, ConciergeFeedback(it)) }
                 )
             }
-            if (state == ConciergeConversationState.RESPONDING && messages.lastOrNull()?.isStreaming != true) {
+            if (state == ConciergeConversationState.Responding && messages.lastOrNull()?.isStreaming != true) {
                 item { Text("…") }
             }
-            if (state == ConciergeConversationState.FAILED) {
-                item { Text("Something went wrong. Try again.", color = MaterialTheme.colorScheme.error) }
+            when (val current = state) {
+                is ConciergeConversationState.Failed -> item {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Something went wrong (${current.error}).", color = MaterialTheme.colorScheme.error)
+                        TextButton(onClick = { conversation.retry() }) { Text("Retry") }
+                    }
+                }
+                is ConciergeConversationState.Closed -> item {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("This chat has ended (${current.reason}).", color = MaterialTheme.colorScheme.error)
+                        TextButton(onClick = viewModel::newChat) { Text("New chat") }
+                    }
+                }
+                else -> Unit
             }
         }
         Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -247,15 +310,15 @@ private fun HeadlessChatScreen(viewModel: HeadlessChatViewModel) {
                 maxLines = 4
             )
             Spacer(Modifier.width(8.dp))
-            if (state == ConciergeConversationState.RESPONDING) {
+            if (state == ConciergeConversationState.Responding) {
                 OutlinedButton(onClick = conversation::cancel) { Text("Stop") }
             } else {
                 Button(
                     onClick = {
-                        conversation.send(input)
-                        input = ""
+                        // Keep the text if the message wasn't sent, for example during a reset.
+                        if (conversation.send(input) == ConciergeSendResult.ACCEPTED) input = ""
                     },
-                    enabled = input.isNotBlank()
+                    enabled = input.isNotBlank() && !state.isClosed
                 ) { Text("Send") }
             }
         }
@@ -270,6 +333,16 @@ private fun MessageView(
     onInteraction: (ConciergeInteraction) -> Unit,
     onRate: (ConciergeFeedback.Rating) -> Unit
 ) {
+    if (message.role == ConciergeMessage.Role.APP) {
+        Text(
+            text = message.text,
+            modifier = Modifier.fillMaxWidth(),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        return
+    }
     if (message.role == ConciergeMessage.Role.USER) {
         Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
             Text(

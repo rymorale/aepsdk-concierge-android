@@ -113,7 +113,7 @@ Each agent reply is a `ConciergeMessage` in `conversation.messages`. While it st
 
 While a turn streams, the text may contain unfinished Markdown, such as an unclosed `**`. Re-render it on every update. The text is complete when `isStreaming` is false.
 
-While `state` is `RESPONDING` and the agent message hasn't appeared, show your own loading indicator. The extension shows animated dots, colored with `--thinking-dot-color`.
+While `state` is `Responding` and the agent message hasn't appeared, show your own loading indicator. The extension shows animated dots, colored with `--thinking-dot-color`.
 
 ### Citations
 
@@ -148,7 +148,7 @@ Inserting from the end keeps the earlier indexes valid. Use any marker your Mark
 
 ### Links
 
-When `citations.showLinkIcon` is on, the built-in UI draws an icon after each inline link. It picks the icon from the service's link hints, which tag a link as a `phone` or `store` link. `ConciergeMessage` doesn't include link hints yet, so draw one icon for every link, or pick one from the URL scheme, such as `tel:`.
+When `citations.showLinkIcon` is on, the built-in UI draws an icon after each inline link. It picks the icon from the service's link hints, which tag a link as a `phone` or `store` link. Use `ConciergeMessage.linkHints` the same way: find the link whose URL matches a hint's `href` and draw an icon for its `kind`. Report a tap on it with `ConciergeInteraction.LinkHintClicked`.
 
 When the user taps a link in the text, report it with `ConciergeInteraction.LinkClicked`.
 

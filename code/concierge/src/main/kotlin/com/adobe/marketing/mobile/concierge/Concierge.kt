@@ -16,6 +16,10 @@ import com.adobe.marketing.mobile.concierge.cards.ConciergeCardRenderers
 import com.adobe.marketing.mobile.concierge.ui.chat.ConciergeChat
 import com.adobe.marketing.mobile.concierge.ui.chat.ConciergeChatView
 import com.adobe.marketing.mobile.services.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** Public class containing APIs for the Brand Concierge extension. */
 object Concierge {
@@ -32,20 +36,51 @@ object Concierge {
      * Starts a conversation with no UI, for apps that draw the chat themselves. See
      * [ConciergeConversation].
      *
-     * Call on the main thread, after the extension is registered and configured. [surfaces] are
-     * shared with the built-in chat UI: the last surfaces set, by either one, are used for every
-     * request.
+     * Call from a coroutine on the main thread, after the extension is registered. Waits up to
+     * five seconds for the Brand Concierge configuration and the Experience Cloud ID, then
+     * returns the conversation.
+     *
+     * [surfaces] belong to this conversation. They don't change the surfaces the built-in chat UI
+     * uses, and other conversations can use different surfaces. Starting a conversation closes the
+     * open one on the same surfaces with [ConciergeCloseReason.REPLACED].
      *
      * @param surfaces the surface URLs that identify the Brand Concierge experience.
+     * @throws IllegalArgumentException if [surfaces] has no non-blank surface.
+     * @throws ConciergeConfigurationException if the configuration or the Experience Cloud ID
+     * isn't ready in time.
      */
-    @JvmStatic
-    fun conversation(surfaces: List<String>): ConciergeConversation {
-        if (surfaces.none { it.isNotBlank() }) {
-            Log.warning(ConciergeConstants.EXTENSION_NAME, "Concierge", "conversation() called without surfaces; requests will fail.")
+    suspend fun conversation(surfaces: List<String>): ConciergeConversation =
+        conversation(surfaces, ConciergeStateRepository.instance, ConciergeSessionManager.instance, CONFIGURATION_TIMEOUT_MS) { validSurfaces, sessionId ->
+            val inBackground = withContext(Dispatchers.Main.immediate) { AppBackgroundState.inBackground }
+            ConciergeConversation(validSurfaces, sessionId, appInBackground = inBackground)
         }
-        ConciergeStateRepository.instance.setSurfaces(surfaces)
-        return ConciergeConversation()
+
+    internal suspend fun conversation(
+        surfaces: List<String>,
+        repository: ConciergeStateRepository,
+        sessionManager: ConciergeSessionManager,
+        timeoutMillis: Long,
+        create: suspend (surfaces: List<String>, sessionId: String) -> ConciergeConversation
+    ): ConciergeConversation {
+        val validSurfaces = surfaces.filter { it.isNotBlank() }
+        require(validSurfaces.isNotEmpty()) { "conversation() requires at least one non-blank surface." }
+        withTimeoutOrNull(timeoutMillis) {
+            repository.state.first { it.configurationReady && it.experienceCloudId != null && !it.resetInProgress }
+        } ?: run {
+            val state = repository.state.value
+            val missing = when {
+                !state.configurationReady -> "the Brand Concierge configuration"
+                state.experienceCloudId == null -> "the Experience Cloud ID"
+                else -> "the end of the identity reset"
+            }
+            Log.warning(ConciergeConstants.EXTENSION_NAME, "Concierge", "conversation() failed: $missing is not ready.")
+            throw ConciergeConfigurationException("Concierge isn't ready: waiting for $missing.")
+        }
+        val sessionId = withContext(Dispatchers.IO) { sessionManager.getSessionId() }
+        return create(validSurfaces, sessionId)
     }
+
+    private const val CONFIGURATION_TIMEOUT_MS = 5_000L
 
     /**
      * Enables tracking of user interactions with the concierge chat interface. This allows the extension to collect data on user behavior and interactions, which can be used for analytics and improving the concierge experience.

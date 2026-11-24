@@ -97,7 +97,9 @@ internal class ConciergeConversationServiceClient(
     private val stateRepository: ConciergeStateRepository = ConciergeStateRepository.instance,
     private val sessionManager: ConciergeSessionManager = ConciergeSessionManager.instance,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-    private val feedbackDispatcher: CoroutineDispatcher = Dispatchers.IO
+    private val feedbackDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    // Set for a ConciergeConversation, which owns its surfaces. Null reads the shared state.
+    private val surfaces: List<String>? = null
 ) : ConversationService {
 
     companion object {
@@ -258,7 +260,7 @@ internal class ConciergeConversationServiceClient(
         state: ConciergeState,
         xdmFields: Map<String, Any>
     ): String {
-        val surfaces = state.surfaces
+        val surfaces = this.surfaces ?: state.surfaces
         check(surfaces.any { it.isNotBlank() }) {
             "Unable to create Concierge request payload. No surfaces were provided."
         }

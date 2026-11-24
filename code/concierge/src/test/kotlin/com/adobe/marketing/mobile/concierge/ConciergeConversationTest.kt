@@ -13,9 +13,13 @@
 package com.adobe.marketing.mobile.concierge
 
 import com.adobe.marketing.mobile.Event
+import com.adobe.marketing.mobile.SharedStateResult
+import com.adobe.marketing.mobile.SharedStateStatus
+import com.adobe.marketing.mobile.concierge.network.ConciergeHttpStatusException
 import com.adobe.marketing.mobile.concierge.network.ConversationService
 import com.adobe.marketing.mobile.concierge.network.ConversationState
 import com.adobe.marketing.mobile.concierge.network.CtaButton
+import com.adobe.marketing.mobile.concierge.network.LinkHint
 import com.adobe.marketing.mobile.concierge.network.MultimodalElement
 import com.adobe.marketing.mobile.concierge.network.ParsedConversationMessage
 import com.adobe.marketing.mobile.concierge.network.ParsedMultimodalItem
@@ -24,14 +28,18 @@ import com.adobe.marketing.mobile.concierge.ui.state.Feedback
 import com.adobe.marketing.mobile.concierge.ui.state.FeedbackType
 import com.adobe.marketing.mobile.services.ServiceProvider
 import io.mockk.every
+import io.mockk.verify
 import io.mockk.mockk
 import io.mockk.mockkStatic
 import io.mockk.unmockkStatic
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -45,6 +53,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.io.IOException
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ConciergeConversationTest {
@@ -64,6 +73,7 @@ class ConciergeConversationTest {
         every { ServiceProvider.getInstance() } returns mockk(relaxed = true)
         sessionManager = mockk(relaxed = true)
         every { sessionManager.getSessionId() } returns "session-1"
+        every { sessionManager.currentSessionIdOrNull() } returns "session-1"
         repository = ConciergeStateRepository(
             sessionManager = sessionManager,
             resetWarningScope = CoroutineScope(StandardTestDispatcher())
@@ -83,7 +93,7 @@ class ConciergeConversationTest {
         val conversation = conversation()
 
         conversation.send("  running shoes  ")
-        assertEquals(ConciergeConversationState.RESPONDING, conversation.state.value)
+        assertEquals(ConciergeConversationState.Responding, conversation.state.value)
         assertEquals("running shoes", conversation.messages.value.single().text)
 
         responses.send(inProgress("Here are"))
@@ -101,7 +111,7 @@ class ConciergeConversationTest {
         responses.close()
 
         val reply = conversation.messages.value.last()
-        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+        assertEquals(ConciergeConversationState.Idle, conversation.state.value)
         assertEquals("Here are some shoes.", reply.text)
         assertFalse(reply.isStreaming)
         assertEquals(listOf("More like this"), reply.promptSuggestions)
@@ -133,7 +143,7 @@ class ConciergeConversationTest {
 
         conversation.send("hello")
 
-        assertEquals(ConciergeConversationState.FAILED, conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.INVALID_RESPONSE_DATA), conversation.state.value)
         assertEquals(listOf(ConciergeMessage.Role.USER), conversation.messages.value.map { it.role })
         val error = dispatched.single { it.name == names.ERROR_OCCURRED }
         assertEquals("Conversation error: Server unavailable", error.eventData[keys.ERROR_MESSAGE])
@@ -146,7 +156,7 @@ class ConciergeConversationTest {
 
         conversation.send("hello")
 
-        assertEquals(ConciergeConversationState.FAILED, conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.INVALID_RESPONSE_DATA), conversation.state.value)
         assertEquals(1, conversation.messages.value.size)
     }
 
@@ -163,7 +173,7 @@ class ConciergeConversationTest {
 
         conversation.cancel()
 
-        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+        assertEquals(ConciergeConversationState.Idle, conversation.state.value)
         val partial = conversation.messages.value.last()
         assertEquals("Partial", partial.text)
         assertFalse(partial.isStreaming)
@@ -207,7 +217,7 @@ class ConciergeConversationTest {
     }
 
     @Test
-    fun `an identity reset clears the conversation and acknowledges the teardown`() = runTest {
+    fun `an identity reset clears and closes the conversation and acknowledges the teardown`() = runTest {
         val responses = Channel<ParsedConversationMessage>(Channel.UNLIMITED)
         service.responses = responses.receiveAsFlow()
         val conversation = conversation()
@@ -218,12 +228,12 @@ class ConciergeConversationTest {
         repository.beginIdentityReset(mockk(relaxed = true)) { resetEvents.add(it) }
 
         assertTrue(conversation.messages.value.isEmpty())
-        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+        assertEquals(ConciergeConversationState.Closed(ConciergeCloseReason.IDENTITY_RESET), conversation.state.value)
         val ended = resetEvents.single { it.name == names.CONVERSATION_ENDED }
         assertEquals("conv-1", ended.eventData[keys.CONVERSATION_ID])
         assertEquals(true, ended.eventData[keys.HAD_ACTIVE_TURN])
 
-        conversation.send("blocked until the reset completes")
+        assertEquals(ConciergeSendResult.CLOSED, conversation.send("after the reset"))
         assertTrue(conversation.messages.value.isEmpty())
     }
 
@@ -263,7 +273,7 @@ class ConciergeConversationTest {
         conversation.send("ignored")
         conversation.close()
 
-        assertEquals(ConciergeConversationState.CLOSED, conversation.state.value)
+        assertEquals(ConciergeConversationState.Closed(ConciergeCloseReason.CLOSED_BY_APP), conversation.state.value)
         assertEquals(listOf("hello", "Partial"), conversation.messages.value.map { it.text })
         assertFalse(conversation.messages.value.last().isStreaming)
         assertEquals(1, service.cleanups)
@@ -271,7 +281,6 @@ class ConciergeConversationTest {
 
     @Test
     fun `a data handoff shows the local message and streams the response`() = runTest {
-        every { sessionManager.currentSessionIdOrNull() } returns "session-1"
         repository.updateXDMContext(mapOf("fan" to mapOf("seat" to "A1")))
         service.handoffResponses = flowOf(inProgress("Thanks"), completed("Thanks for your order"))
         val conversation = conversation()
@@ -279,9 +288,9 @@ class ConciergeConversationTest {
         handoff(localMessage = "Order placed")
 
         assertEquals(listOf(DataHandoffDeliveryResult.Delivered), handoffResults)
-        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+        assertEquals(ConciergeConversationState.Idle, conversation.state.value)
         assertEquals(
-            listOf(ConciergeMessage.Role.AGENT to "Order placed", ConciergeMessage.Role.AGENT to "Thanks for your order"),
+            listOf(ConciergeMessage.Role.APP to "Order placed", ConciergeMessage.Role.AGENT to "Thanks for your order"),
             conversation.messages.value.map { it.role to it.text }
         )
         assertEquals("successful-checkout", service.handoffRoutingHint)
@@ -321,7 +330,7 @@ class ConciergeConversationTest {
             listOf(DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.DELIVERY_TIMEOUT)),
             handoffResults
         )
-        assertEquals(ConciergeConversationState.FAILED, conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.TIMEOUT), conversation.state.value)
         assertEquals(listOf("Order placed"), conversation.messages.value.map { it.text })
     }
 
@@ -341,7 +350,191 @@ class ConciergeConversationTest {
             ),
             handoffResults
         )
-        assertEquals(ConciergeConversationState.IDLE, conversation.state.value)
+        assertEquals(ConciergeConversationState.Idle, conversation.state.value)
+    }
+
+    @Test
+    fun `send reports why a message was ignored`() = runTest {
+        service.responses = Channel<ParsedConversationMessage>().receiveAsFlow()
+        val conversation = conversation()
+
+        assertEquals(ConciergeSendResult.BLANK, conversation.send("   "))
+        assertEquals(ConciergeSendResult.ACCEPTED, conversation.send("hello"))
+        assertEquals(ConciergeSendResult.IN_PROGRESS, conversation.send("again"))
+        assertEquals(ConciergeSendResult.IN_PROGRESS, conversation.retry())
+        conversation.cancel()
+        assertEquals(ConciergeSendResult.NOTHING_TO_RETRY, conversation.retry())
+        conversation.close()
+        assertEquals(ConciergeSendResult.CLOSED, conversation.send("closed"))
+
+        repository.beginIdentityReset(mockk(relaxed = true)) {}
+        assertEquals(ConciergeSendResult.RESET_PENDING, conversation().send("during reset"))
+    }
+
+    @Test
+    fun `retry resends the failed message without adding it again`() = runTest {
+        service.responses = emptyFlow()
+        val conversation = conversation()
+        conversation.send("hello")
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.INVALID_RESPONSE_DATA), conversation.state.value)
+
+        service.responses = flowOf(completed("Answer"))
+        assertEquals(ConciergeSendResult.ACCEPTED, conversation.retry())
+
+        assertEquals(ConciergeConversationState.Idle, conversation.state.value)
+        assertEquals(listOf("hello", "Answer"), conversation.messages.value.map { it.text })
+        assertEquals(listOf("hello", "hello"), service.queries)
+        assertEquals(ConciergeSendResult.NOTHING_TO_RETRY, conversation.retry())
+    }
+
+    @Test
+    fun `a failed data handoff can't be retried`() = runTest {
+        val conversation = conversation()
+        handoff()
+
+        assertTrue(conversation.state.value is ConciergeConversationState.Failed)
+        assertEquals(ConciergeSendResult.NOTHING_TO_RETRY, conversation.retry())
+    }
+
+    @Test
+    fun `the conversation keeps its session and closes when the session expires`() = runTest {
+        service.responses = flowOf(completed("Answer"))
+        val conversation = conversation()
+        conversation.send("hello")
+        assertEquals("session-1", conversation.sessionId)
+        assertEquals(listOf("session-1"), service.sessionIds)
+        verify(exactly = 0) { sessionManager.getSessionId() }
+
+        every { sessionManager.currentSessionIdOrNull() } returns "session-2"
+
+        assertEquals(ConciergeSendResult.CLOSED, conversation.send("again"))
+        assertEquals(ConciergeConversationState.Closed(ConciergeCloseReason.SESSION_EXPIRED), conversation.state.value)
+        assertEquals(listOf("hello", "Answer"), conversation.messages.value.map { it.text })
+    }
+
+    @Test
+    fun `a new conversation on the same surfaces replaces the open one`() = runTest {
+        val first = conversation()
+        val other = conversation(listOf("other"))
+        val second = conversation()
+
+        assertEquals(ConciergeConversationState.Closed(ConciergeCloseReason.REPLACED), first.state.value)
+        assertEquals(ConciergeConversationState.Idle, other.state.value)
+        assertEquals(ConciergeConversationState.Idle, second.state.value)
+    }
+
+    @Test
+    fun `data handoffs go to the conversation most recently opened or used`() = runTest {
+        service.responses = flowOf(completed("Answer"))
+        val first = conversation()
+        val second = conversation(listOf("other"))
+
+        handoff(localMessage = "To second")
+        first.send("hello")
+        handoff(localMessage = "To first")
+
+        assertEquals("To second", second.messages.value.first().text)
+        assertEquals(listOf("hello", "Answer", "To first"), first.messages.value.map { it.text })
+    }
+
+    @Test
+    fun `a message interrupted in the background is resent once in the foreground`() = runTest {
+        val background = MutableStateFlow(true)
+        service.responses = flow { throw IOException("Connection reset") }
+        val conversation = conversation(appInBackground = background)
+
+        conversation.send("hello")
+        assertEquals(ConciergeConversationState.Responding, conversation.state.value)
+        assertEquals(listOf("hello"), conversation.messages.value.map { it.text })
+        assertTrue(dispatched.none { it.name == names.ERROR_OCCURRED })
+
+        background.value = false
+
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.UNREACHABLE), conversation.state.value)
+        assertEquals(listOf("hello", "hello"), service.queries)
+        assertEquals(1, dispatched.count { it.name == names.ERROR_OCCURRED })
+    }
+
+    @Test
+    fun `the background resend is skipped when the session expired`() = runTest {
+        val background = MutableStateFlow(true)
+        service.responses = flow { throw IOException("Connection reset") }
+        val conversation = conversation(appInBackground = background)
+        conversation.send("hello")
+
+        every { sessionManager.currentSessionIdOrNull() } returns null
+        service.responses = flowOf(completed("Answer"))
+        background.value = false
+
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.UNREACHABLE), conversation.state.value)
+        assertEquals(listOf("hello"), service.queries)
+    }
+
+    @Test
+    fun `link hints are mapped and a tapped hint is tracked`() = runTest {
+        service.responses = flowOf(
+            completed("Call us").copy(linkHints = listOf(LinkHint(kind = "phone", href = "tel:5551234")))
+        )
+        val conversation = conversation()
+        conversation.send("hello")
+        val hint = conversation.messages.value.last().linkHints.single()
+        assertEquals(ConciergeLinkHint("tel:5551234", "phone"), hint)
+
+        conversation.track(ConciergeInteraction.LinkHintClicked(hint))
+
+        val event = dispatched.last()
+        assertEquals(names.LINK_CLICKED, event.name)
+        assertEquals("linkHint", event.eventData[keys.ORIGIN])
+    }
+
+    @Test
+    fun `an HTTP status error after a complete response fails the turn`() = runTest {
+        service.responses = flow {
+            emit(completed("Answer"))
+            throw ConciergeHttpStatusException(500, "Server error")
+        }
+        val conversation = conversation()
+
+        conversation.send("hello")
+
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.INVALID_RESPONSE_DATA), conversation.state.value)
+        assertEquals(listOf(ConciergeMessage.Role.USER), conversation.messages.value.map { it.role })
+    }
+
+    @Test
+    fun `conversation waits for configuration and uses only non-blank surfaces`() = runTest {
+        val notReady = ConciergeStateRepository(
+            initialState = ConciergeState(experienceCloudId = "ecid"),
+            sessionManager = sessionManager,
+            resetWarningScope = CoroutineScope(StandardTestDispatcher())
+        )
+        var created: List<String>? = null
+        val result = async {
+            Concierge.conversation(listOf("", "surface"), notReady, sessionManager, 5_000L) { surfaces, _ ->
+                created = surfaces
+                conversation()
+            }
+        }
+        testScheduler.runCurrent()
+        assertNull(created)
+
+        notReady.updateConfiguration(SharedStateResult(SharedStateStatus.SET, mapOf("concierge.server" to "server")))
+        result.await()
+
+        assertEquals(listOf("surface"), created)
+    }
+
+    @Test
+    fun `conversation throws when configuration isn't ready in time or surfaces are blank`() = runTest {
+        val configurationError = runCatching {
+            Concierge.conversation(listOf("surface"), repository, sessionManager, 5_000L) { _, _ -> conversation() }
+        }.exceptionOrNull()
+        val surfacesError = runCatching {
+            Concierge.conversation(listOf(" "), repository, sessionManager, 5_000L) { _, _ -> conversation() }
+        }.exceptionOrNull()
+
+        assertTrue(configurationError is ConciergeConfigurationException)
+        assertTrue(surfacesError is IllegalArgumentException)
     }
 
     private fun handoff(localMessage: String? = null) {
@@ -350,14 +543,18 @@ class ConciergeConversationTest {
         ) { handoffResults.add(it) }
     }
 
-    private fun TestScope.conversation(): ConciergeConversation {
-        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+    private fun TestScope.conversation(
+        surfaces: List<String> = listOf("surface"),
+        appInBackground: MutableStateFlow<Boolean>? = null
+    ): ConciergeConversation {
         return ConciergeConversation(
+            surfaces = surfaces,
+            sessionId = "session-1",
             stateRepository = repository,
             sessionManager = sessionManager,
             service = service,
-            dispatcher = dispatcher,
-            sessionDispatcher = dispatcher,
+            dispatcher = UnconfinedTestDispatcher(testScheduler),
+            appInBackground = appInBackground,
             dispatch = { dispatched.add(it) },
             currentTimeMillis = { 1_000L }
         ).also { conversations.add(it) }
@@ -414,9 +611,15 @@ class ConciergeConversationTest {
         var handoffRoutingHint: String? = null
         var handoffXdmFields: Map<String, Any>? = null
         val feedback = mutableListOf<Feedback>()
+        val queries = mutableListOf<String>()
+        val sessionIds = mutableListOf<String?>()
         var cleanups = 0
 
-        override fun chat(message: String, xdmFields: Map<String, Any>, sessionId: String?) = responses
+        override fun chat(message: String, xdmFields: Map<String, Any>, sessionId: String?): Flow<ParsedConversationMessage> {
+            queries.add(message)
+            sessionIds.add(sessionId)
+            return responses
+        }
         override fun sendDataHandoff(routingHint: String, xdmFields: Map<String, Any>, sessionId: String?): Flow<ParsedConversationMessage> {
             handoffRoutingHint = routingHint
             handoffXdmFields = xdmFields

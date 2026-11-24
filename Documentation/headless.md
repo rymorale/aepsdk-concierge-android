@@ -16,22 +16,34 @@ Set up the extension as described in the [Implementation Guide](implementation-g
 
 ```kotlin
 class ChatViewModel : ViewModel() {
-    val conversation = Concierge.conversation(listOf("web://example.com/index.html"))
+    var conversation by mutableStateOf<ConciergeConversation?>(null)
+        private set
 
     init {
-        conversation.track(ConciergeInteraction.Opened)
+        viewModelScope.launch {
+            try {
+                conversation = Concierge.conversation(listOf("web://example.com/index.html"))
+                    .also { it.track(ConciergeInteraction.Opened) }
+            } catch (e: ConciergeConfigurationException) {
+                // The extension isn't configured, or there's no Experience Cloud ID yet.
+            }
+        }
     }
 
     override fun onCleared() {
-        conversation.track(ConciergeInteraction.Closed)
-        conversation.close()
+        conversation?.track(ConciergeInteraction.Closed)
+        conversation?.close()
     }
 }
 ```
 
-`Concierge.conversation(surfaces)` returns a `ConciergeConversation`. Create it and call its methods on the main thread. Call `close()` when you no longer need it. After `close()`, the conversation ignores new messages.
+`Concierge.conversation(surfaces)` is a `suspend` function that returns a `ConciergeConversation`. Call it from a coroutine on the main thread, and call the conversation's methods on the main thread. Call `close()` when you no longer need it. After `close()`, the conversation ignores new messages.
 
-The surfaces are shared with the built-in chat UI. If both set surfaces, the last ones set are used for every request.
+`Concierge.conversation` waits up to five seconds for the extension to be ready: the Brand Concierge configuration has been received, Edge Identity has an Experience Cloud ID, and no identity reset is in progress. If any of these is still missing, it throws `ConciergeConfigurationException`. It throws `IllegalArgumentException` if `surfaces` has no non-blank surface.
+
+The surfaces belong to the conversation. They don't change the surfaces of the built-in chat UI, and two conversations can use different surfaces. Only one conversation is open per set of surfaces: starting another conversation with the same surfaces closes the open one with `REPLACED`.
+
+The conversation uses the session that was current when it started; `sessionId` returns it. When that session expires, the conversation closes with `SESSION_EXPIRED` the next time you send a message, and `send` returns `CLOSED`. Start a new conversation to continue.
 
 ## Send messages
 
@@ -51,11 +63,12 @@ val state by conversation.state.collectAsStateWithLifecycle()
 | Property | Meaning |
 | --- | --- |
 | `id` | Identifies the message. Use it as a list key and for feedback. |
-| `role` | `USER` or `AGENT`. |
+| `role` | `USER`, `AGENT`, or `APP` for text the app added, such as a data handoff's `localMessage`. |
 | `text` | The message text, which can contain Markdown. While `isStreaming` is true, it holds the text received so far. |
 | `isStreaming` | True while the agent is still writing this message. |
 | `elements` | Product cards, CTA buttons and other elements, in response order. Set when the response completes. |
 | `sources` | Citations. `startIndex` and `endIndex` locate the cited text. |
+| `linkHints` | Links in `text` that the agent tagged with a `kind`, such as `phone` or `store`. Each `href` matches a link's URL in the text, so you can mark it, for example with an icon. Set when the response completes. |
 | `promptSuggestions` | Follow-up prompts the user can send. |
 | `feedbackEnabled` | True when the message can receive feedback. |
 | `feedback` | The rating sent for this message, or null. |
@@ -64,12 +77,45 @@ val state by conversation.state.collectAsStateWithLifecycle()
 
 | State | Meaning |
 | --- | --- |
-| `IDLE` | Ready to send. |
-| `RESPONDING` | Waiting for or receiving a reply. Show a loading indicator until the agent message appears. |
-| `FAILED` | The last reply failed. Its agent message is removed and the user message stays. The user can send again. |
-| `CLOSED` | `close()` was called. |
+| `Idle` | Ready to send. |
+| `Responding` | Waiting for or receiving a reply. Show a loading indicator until the agent message appears. |
+| `Failed(error)` | The last reply failed. Its agent message is removed and the user message stays. The user can send again, or call `retry()`. |
+| `Closed(reason)` | The conversation has ended. Start a new one to continue. |
 
-Only one reply runs at a time. `send` ignores a message while the state is `RESPONDING`; messages are not queued. Call `cancel()` to stop a reply. The text received so far stays in `messages`.
+`Failed.error` is a `ConciergeError`:
+
+| Error | Meaning |
+| --- | --- |
+| `UNREACHABLE` | The service couldn't be reached. |
+| `TIMEOUT` | The request timed out. |
+| `INVALID_RESPONSE_DATA` | The service returned an error status, an error, or no response. |
+| `UNKNOWN` | Any other error. |
+
+`Closed.reason` is a `ConciergeCloseReason`:
+
+| Reason | Meaning |
+| --- | --- |
+| `CLOSED_BY_APP` | `close()` was called. |
+| `REPLACED` | Another conversation started with the same surfaces. |
+| `SESSION_EXPIRED` | The conversation's session expired. |
+| `IDENTITY_RESET` | Identities were reset. The messages are cleared. |
+
+Only one reply runs at a time. `send` ignores a message while the state is `Responding`; messages are not queued. Call `cancel()` to stop a reply. The text received so far stays in `messages`.
+
+After a failure, `retry()` sends the failed message again without adding another user message. A failed data handoff can't be retried.
+
+If the app goes to the background during a reply and the reply then fails to reach the service, the conversation sends the message once more when the app returns to the foreground, unless the session has expired. If that also fails, `state` is `Failed`.
+
+`send` returns a `ConciergeSendResult`. You can ignore it, or use it to keep the user's text when a message wasn't sent:
+
+| Result | Meaning |
+| --- | --- |
+| `ACCEPTED` | The message was sent. |
+| `BLANK` | The message is blank. |
+| `IN_PROGRESS` | A reply or data handoff is in progress. |
+| `CLOSED` | The conversation is closed. |
+| `RESET_PENDING` | An identity reset is in progress. Send again after it finishes. |
+| `NOTHING_TO_RETRY` | Returned only by `retry()`: the last reply didn't fail, or it was a data handoff. |
 
 ## Elements
 
@@ -107,8 +153,9 @@ The conversation reports its own events, such as a submitted query and a started
 | `ProductActionClicked` | A product card button is tapped. |
 | `SourceClicked` | A citation is tapped. |
 | `LinkClicked` | A link in the message text is tapped. |
+| `LinkHintClicked` | A link with a link hint, or your marker for it, is tapped. |
 
-`track` only reports. Your app opens the link or sends the suggestion:
+`track` only reports, and is ignored after the conversation closes. Your app opens the link or sends the suggestion:
 
 ```kotlin
 fun onInteraction(interaction: ConciergeInteraction) {
@@ -120,6 +167,7 @@ fun onInteraction(interaction: ConciergeInteraction) {
         is ConciergeInteraction.ProductActionClicked -> interaction.action.url?.let(::openLink)
         is ConciergeInteraction.SourceClicked -> openLink(interaction.source.url)
         is ConciergeInteraction.LinkClicked -> openLink(interaction.url)
+        is ConciergeInteraction.LinkHintClicked -> openLink(interaction.hint.href)
         else -> Unit
     }
 }
@@ -131,7 +179,7 @@ Links come from the service. Before opening one, check its scheme. See [Links](h
 
 ## Identity reset
 
-When identities are reset, the conversation clears its messages and stops any reply in progress, like the built-in UI. Messages sent before the extension is ready again are ignored.
+When identities are reset, the conversation stops any reply in progress, clears its messages and closes with `IDENTITY_RESET`. Start a new conversation; `Concierge.conversation` waits for the reset to finish.
 
 ## Data handoff
 
@@ -145,18 +193,13 @@ Concierge.sendDataHandoff(
 ) { accepted, rejectReason -> }
 ```
 
-- `localMessage`, if set, is added to `messages` as an `AGENT` message, because the user didn't type it. The response then streams in like a reply to `send`, and `state` is `RESPONDING` until it finishes.
+- `localMessage`, if set, is added to `messages` as an `APP` message, because the user didn't type it. The response then streams in like a reply to `send`, and `state` is `Responding` until it finishes.
 - The handoff is rejected with `CHAT_IN_PROGRESS` while a reply is in progress, and with `NO_ACTIVE_SESSION` after `close` or during an identity reset.
-- If the handoff fails or times out, the response is removed, `localMessage` stays, and `state` is `FAILED`. `cancel` stops it and reports `DELIVERY_FAILED`.
-- Only one chat receives handoffs: the most recently opened conversation, `ConciergeChat` or `ConciergeChatView`.
-
-## Not yet supported
-
-- Link hints, which tag links in the text as phone or store links, are not in `ConciergeMessage`.
-- Messages are not queued or resent in the background.
+- If the handoff fails or times out, the response is removed, `localMessage` stays, and `state` is `Failed`. `cancel` stops it and reports `DELIVERY_FAILED`.
+- Only one chat receives handoffs: the conversation, `ConciergeChat` or `ConciergeChatView` most recently opened or sent a message.
 
 ## Sample
 
-The test app's **Headless Chat** screen (`HeadlessChatActivity`) is a complete example. It streams replies, shows product cards in a paged carousel or a two-column grid with images loaded by [Coil](https://coil-kt.github.io/coil/), and shows CTAs, sources and suggestions. It also sends feedback, reports taps, stops replies and starts new chats. Tapping a product's primary CTA (for example **Buy now**) simulates a completed checkout and calls `Concierge.sendDataHandoff`, so the agent replies in the same chat.
+The test app's **Headless Chat** screen (`HeadlessChatActivity`) is a complete example. It streams replies, shows product cards in a paged carousel or a two-column grid with images loaded by [Coil](https://coil-kt.github.io/coil/), and shows CTAs, sources and suggestions. It also sends feedback, reports taps, stops and retries replies, and starts new chats. Tapping a product's primary CTA (for example **Buy now**) simulates a completed checkout and calls `Concierge.sendDataHandoff`, so the agent replies in the same chat.
 
 To style a headless chat without a theme JSON, see [Styling a headless UI](headless-styling.md).
