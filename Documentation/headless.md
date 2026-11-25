@@ -127,7 +127,7 @@ Each agent message's `elements` are `ConciergeElement` values:
 | Element | Contents |
 | --- | --- |
 | `ProductCard` | Product name, descriptions, page and image URLs, price, was-price, badge, and primary and secondary `ConciergeAction` buttons. |
-| `CtaButton` | A label and URL. |
+| `CtaButton` | A label, and a URL unless it is a text-only CTA. |
 | `Custom` | A `custom` element with a `rendererId`, for your own renderer. |
 | `Unknown` | Any other element. |
 
@@ -145,13 +145,13 @@ The message's `feedback` changes to the rating. Like the built-in UI, a response
 
 ## Analytics
 
-The conversation reports its own events, such as a submitted query and a started or completed response. Report the user's taps with `track`. Each interaction sends the same events as the built-in UI:
+The conversation reports its own events, such as a submitted query, a started or completed response, and the product cards a response contains. If the service hasn't returned a conversation or interaction ID, the events send `unknown`. Report the user's taps with `track`. Each interaction sends the same events as the built-in UI:
 
 | Interaction | When |
 | --- | --- |
 | `Opened`, `Closed` | The chat is shown or hidden. `Closed` reports the time since `Opened`. |
 | `PromptSuggestionClicked` | A prompt suggestion is tapped. |
-| `CtaClicked` | A CTA button is tapped. |
+| `CtaClicked` | A CTA button is tapped. A text-only CTA has no `url`; it reports the tap but no link. |
 | `ProductCardClicked` | A product card is tapped. |
 | `ProductActionClicked` | A product card button is tapped. |
 | `SourceClicked` | A citation is tapped. |
@@ -165,7 +165,7 @@ fun onInteraction(interaction: ConciergeInteraction) {
     conversation.track(interaction)
     when (interaction) {
         is ConciergeInteraction.PromptSuggestionClicked -> conversation.send(interaction.suggestion)
-        is ConciergeInteraction.CtaClicked -> openLink(interaction.url)
+        is ConciergeInteraction.CtaClicked -> interaction.url?.let(::openLink)
         is ConciergeInteraction.ProductCardClicked -> interaction.card.productPageUrl?.let(::openLink)
         is ConciergeInteraction.ProductActionClicked -> interaction.action.url?.let(::openLink)
         is ConciergeInteraction.SourceClicked -> openLink(interaction.source.url)

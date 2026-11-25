@@ -170,7 +170,7 @@ fun openResponseLink(context: Context, url: String) {
 | Element | How to render it |
 | --- | --- |
 | `ProductCard` | Your card composable. Load `productImageUrl` with your image loader. Show `productBadge` as a label on the image. The service can also send styling values that are only in `raw`: `backgroundColor` and `logo` (in `raw["entity_info"]` or `raw`), and `width`, `height`, `thumbnailWidth` and `thumbnailHeight` (in `raw`). Decide whether they override your theme. Parse colors yourself, and fall back to your theme when a value is invalid. |
-| `CtaButton` | Your button style. Open `url` with your link handler. |
+| `CtaButton` | Your button style. Open `url`, if there is one, with your link handler. |
 | `Custom` | Your own renderer, looked up by `rendererId`. Read its data from `raw`. |
 | `Unknown` | Skip it, or draw a fallback. `raw` holds the element as received. |
 

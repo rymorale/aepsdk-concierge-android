@@ -79,10 +79,11 @@ internal data class ConversationFeedbackInfo(
 
 /**
  * Represents a CTA button that appears as a standalone action below a bot message.
+ * A CTA without a [url] is valid: it is tracked when tapped but opens nothing.
  */
 internal data class CtaButton(
     val label: String,
-    val url: String
+    val url: String? = null
 )
 
 /**

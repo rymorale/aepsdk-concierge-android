@@ -397,7 +397,8 @@ class ConciergeChatViewModelNativeCardTest {
         assertTrue(messages.any { it.content is MessageContent.Mixed })
         val card = requireNotNull(vm.nativeCards.renderableCard(vm.nativeCardIds().single()))
         assertEquals(menu, card.element)
-        assertEquals(3, messages.count { !it.isFromUser })
+        // Text, product card, native menu and the text-only CTA.
+        assertEquals(4, messages.count { !it.isFromUser })
     }
 
     @Test

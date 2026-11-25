@@ -74,10 +74,10 @@ sealed class ConciergeElement {
         override val raw: Map<String, Any?> = emptyMap()
     ) : ConciergeElement()
 
-    /** A standalone call-to-action button. */
+    /** A standalone call-to-action button. [url] is null for a text-only CTA, which opens nothing. */
     data class CtaButton(
         val label: String,
-        val url: String,
+        val url: String?,
         override val raw: Map<String, Any?> = emptyMap()
     ) : ConciergeElement()
 
@@ -142,8 +142,8 @@ sealed class ConciergeInteraction {
     /** A prompt suggestion was tapped. This doesn't send it; call [ConciergeConversation.send] as well. */
     data class PromptSuggestionClicked(val suggestion: String) : ConciergeInteraction()
 
-    /** A [ConciergeElement.CtaButton] was tapped. */
-    data class CtaClicked(val label: String, val url: String) : ConciergeInteraction()
+    /** A [ConciergeElement.CtaButton] was tapped. [url] is null for a text-only CTA. */
+    data class CtaClicked(val label: String, val url: String? = null) : ConciergeInteraction()
 
     /** A product card was tapped, outside its buttons. */
     data class ProductCardClicked(val card: ConciergeElement.ProductCard) : ConciergeInteraction()

@@ -2236,7 +2236,7 @@ class ConversationResponseParserTest {
     }
 
     @Test
-    fun `parseConversationData ignores CTA element with missing url`() {
+    fun `parseConversationData keeps a text-only CTA element without a url`() {
         val json = """
             {
               "handle": [
@@ -2270,7 +2270,9 @@ class ConversationResponseParserTest {
 
         val result = ConversationResponseParser.parseConversationData(json)
         assertEquals(1, result.size)
-        assertTrue(result[0].orderedElements.isEmpty())
+        val cta = result[0].orderedElements.single() as ParsedMultimodalItem.Cta
+        assertEquals("Chat now", cta.button.label)
+        assertNull(cta.button.url)
     }
 
     @Test

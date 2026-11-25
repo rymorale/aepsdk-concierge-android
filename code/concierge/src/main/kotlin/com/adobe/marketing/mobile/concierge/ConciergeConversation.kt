@@ -368,7 +368,7 @@ class ConciergeConversation internal constructor(
         }
         report(
             ConciergeTrackingEvent.FeedbackSubmitted(
-                conversationId = conversationId ?: "",
+                conversationId = conversationId ?: ConciergeConstants.TrackingEvent.UNKNOWN_ID,
                 interactionId = interactionId,
                 feedbackType = when (type) {
                     FeedbackType.POSITIVE -> ConciergeConstants.ChatInteraction.POSITIVE
@@ -412,8 +412,8 @@ class ConciergeConversation internal constructor(
             is ConciergeInteraction.PromptSuggestionClicked ->
                 report(ConciergeTrackingEvent.PromptSuggestionClicked(interaction.suggestion))
             is ConciergeInteraction.CtaClicked -> {
-                report(ConciergeTrackingEvent.CtaButtonClicked(interaction.label, interaction.url))
-                reportLink(interaction.url, origin.CTA)
+                report(ConciergeTrackingEvent.CtaButtonClicked(interaction.label, interaction.url.orEmpty()))
+                interaction.url?.takeIf { it.isNotEmpty() }?.let { reportLink(it, origin.CTA) }
             }
             is ConciergeInteraction.ProductCardClicked -> {
                 val card = interaction.card
@@ -673,13 +673,17 @@ class ConciergeConversation internal constructor(
                 )
             )
         }
-        report(ConciergeTrackingEvent.ResponseCompleted(conversationId ?: "", interactionId ?: ""))
+        val unknown = ConciergeConstants.TrackingEvent.UNKNOWN_ID
+        report(ConciergeTrackingEvent.ResponseCompleted(conversationId ?: unknown, interactionId ?: unknown))
+        val cards = response.orderedElements.filterIsInstance<ParsedMultimodalItem.Card>().map { it.element }
+        if (cards.isNotEmpty()) report(ConciergeTrackingEvent.CardsRendered.forCards(cards))
     }
 
     private fun reportResponseStarted(turn: Turn) {
         if (turn.responseStarted) return
         turn.responseStarted = true
-        report(ConciergeTrackingEvent.ResponseStarted(conversationId ?: "", turn.interactionId ?: ""))
+        val unknown = ConciergeConstants.TrackingEvent.UNKNOWN_ID
+        report(ConciergeTrackingEvent.ResponseStarted(conversationId ?: unknown, turn.interactionId ?: unknown))
     }
 
     private fun hasResponse(turn: Turn) = _messages.value.any { it.id == turn.agentMessageId }

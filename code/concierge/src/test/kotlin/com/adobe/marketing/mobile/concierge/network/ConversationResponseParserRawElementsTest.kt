@@ -111,7 +111,7 @@ class ConversationResponseParserRawElementsTest {
             """
             [
               {"type": "acme.cart", "entity_info": {"id": 695685, "items": []}},
-              {"type": "ctaButton", "id": "c1", "entity_info": {"primary": {"text": "No url"}}},
+              {"type": "ctaButton", "id": "c1", "entity_info": {"secondary": {"text": "No primary"}}},
               {"entity_info": {"productName": "untyped, no id"}}
             ]
             """.trimIndent()

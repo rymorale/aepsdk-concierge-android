@@ -733,7 +733,7 @@ class ConciergeChatViewModel : AndroidViewModel {
      * @param element The [MultimodalElement] image that was clicked
      */
     private fun handleProductImageClick(element: MultimodalElement, handleLink: ((String) -> Boolean)?) {
-        dispatchTrackingEvent(ConciergeTrackingEvent.CardClicked(buildCardElementDict(element.content)))
+        dispatchTrackingEvent(ConciergeTrackingEvent.CardClicked(ConciergeTrackingEvent.CardsRendered.cardElementDict(element.content)))
 
         val url = element.content["productPageURL"] as? String
         if (url.isNullOrEmpty()) {
@@ -742,16 +742,6 @@ class ConciergeChatViewModel : AndroidViewModel {
         }
         Log.debug(ConciergeConstants.EXTENSION_NAME, TAG, "Multimodal element image clicked: ${element.id}, opening URL: $url")
         handleLinkClick(url, ConciergeConstants.TrackingEvent.LinkClickOrigin.PRODUCT_CARD, handleLink)
-    }
-
-    private fun buildCardElementDict(content: Map<String, Any>): Map<String, Any> {
-        val dict = mutableMapOf<String, Any>()
-        content["productName"]?.let { dict["productName"] = it }
-        content["productDescription"]?.let { dict["productDescription"] = it }
-        content["productPageURL"]?.let { dict["productPageURL"] = it }
-        content["productPrice"]?.let { dict["productPrice"] = it }
-        content["productBadge"]?.let { dict["productBadge"] = it }
-        return dict
     }
 
     /**
@@ -780,7 +770,7 @@ class ConciergeChatViewModel : AndroidViewModel {
      */
     private fun handleCtaClicked(cta: CtaButton) {
         Log.debug(ConciergeConstants.EXTENSION_NAME, TAG, "CTA Button Clicked Link clicked {label: ${cta.label}, url: ${cta.url}}")
-        dispatchTrackingEvent(ConciergeTrackingEvent.CtaButtonClicked(label = cta.label, linkUrl = cta.url))
+        dispatchTrackingEvent(ConciergeTrackingEvent.CtaButtonClicked(label = cta.label, linkUrl = cta.url.orEmpty()))
     }
 
     /**
@@ -857,7 +847,7 @@ class ConciergeChatViewModel : AndroidViewModel {
         updateFeedback(null)
 
         dispatchTrackingEvent(ConciergeTrackingEvent.FeedbackSubmitted(
-            conversationId = currentConversationId ?: "",
+            conversationId = currentConversationId ?: ConciergeConstants.TrackingEvent.UNKNOWN_ID,
             interactionId = feedback.interactionId,
             feedbackType = when (feedback.feedbackType) {
                 FeedbackType.POSITIVE -> ConciergeConstants.ChatInteraction.POSITIVE
@@ -1630,8 +1620,8 @@ class ConciergeChatViewModel : AndroidViewModel {
                 if (!responseStartedDispatched && hasVisibleContent) {
                     responseStartedDispatched = true
                     dispatchTrackingEvent(ConciergeTrackingEvent.ResponseStarted(
-                        conversationId = currentConversationId ?: "",
-                        interactionId = parsedMessage.interactionId ?: ""
+                        conversationId = currentConversationId ?: ConciergeConstants.TrackingEvent.UNKNOWN_ID,
+                        interactionId = parsedMessage.interactionId ?: ConciergeConstants.TrackingEvent.UNKNOWN_ID
                     ))
                 }
                 appendToAssistantMessage(parsedMessage, contentBuilder)
@@ -1647,13 +1637,13 @@ class ConciergeChatViewModel : AndroidViewModel {
                 if (!responseStartedDispatched && hasVisibleContent) {
                     responseStartedDispatched = true
                     dispatchTrackingEvent(ConciergeTrackingEvent.ResponseStarted(
-                        conversationId = currentConversationId ?: "",
-                        interactionId = parsedMessage.interactionId ?: ""
+                        conversationId = currentConversationId ?: ConciergeConstants.TrackingEvent.UNKNOWN_ID,
+                        interactionId = parsedMessage.interactionId ?: ConciergeConstants.TrackingEvent.UNKNOWN_ID
                     ))
                 }
                 dispatchTrackingEvent(ConciergeTrackingEvent.ResponseCompleted(
-                    conversationId = currentConversationId ?: "",
-                    interactionId = parsedMessage.interactionId ?: ""
+                    conversationId = currentConversationId ?: ConciergeConstants.TrackingEvent.UNKNOWN_ID,
+                    interactionId = parsedMessage.interactionId ?: ConciergeConstants.TrackingEvent.UNKNOWN_ID
                 ))
                 _state.update { currentState ->
                     when (currentState) {
@@ -1861,9 +1851,7 @@ class ConciergeChatViewModel : AndroidViewModel {
         var cardMessageAppended = false
 
         if (builtInCardElements.isNotEmpty()) {
-            val displayMode = if (builtInCardElements.size == 1) "single" else "carousel"
-            val elementDicts = builtInCardElements.map { element -> buildCardElementDict(element.content) }
-            dispatchTrackingEvent(ConciergeTrackingEvent.CardsRendered(displayMode, elementDicts))
+            dispatchTrackingEvent(ConciergeTrackingEvent.CardsRendered.forCards(builtInCardElements))
         }
 
         val suggestionsIndex = when {

@@ -147,6 +147,9 @@ object ConciergeConstants {
     }
 
     object TrackingEvent {
+        /** Sent in place of a conversation or interaction ID the service hasn't returned. */
+        internal const val UNKNOWN_ID = "unknown"
+
         internal object Name {
             const val SESSION_INITIALIZED            = "Brand Concierge Session Initialized"
             const val CHAT_OPENED                    = "Brand Concierge Chat Opened"

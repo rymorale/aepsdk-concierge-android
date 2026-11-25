@@ -241,7 +241,7 @@ internal object ConversationResponseParser {
         val primaryAction = entityInfo?.let { DataReader.optTypedMap(Any::class.java, it, FIELD_PRIMARY, null) }
         val label = DataReader.optString(primaryAction, FIELD_BUTTON_TEXT, null)?.takeIf { it.isNotEmpty() }
         val url = DataReader.optString(primaryAction, FIELD_BUTTON_URL, null)?.takeIf { it.isNotEmpty() }
-        if (label.isNullOrEmpty() || url.isNullOrEmpty()) return null
+        if (label.isNullOrEmpty()) return null
         return CtaButton(label = label, url = url)
     }
 

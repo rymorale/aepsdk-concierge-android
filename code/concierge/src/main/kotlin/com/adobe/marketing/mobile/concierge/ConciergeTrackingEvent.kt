@@ -12,6 +12,7 @@
 package com.adobe.marketing.mobile.concierge
 
 import com.adobe.marketing.mobile.Event
+import com.adobe.marketing.mobile.concierge.network.MultimodalElement
 
 /**
  * Defines the tracking events dispatched by the Brand Concierge extension to the AEP Event Hub.
@@ -58,7 +59,21 @@ internal sealed class ConciergeTrackingEvent {
     data class CardsRendered(
         val displayMode: String,
         val elements: List<Map<String, Any>>
-    ) : ConciergeTrackingEvent()
+    ) : ConciergeTrackingEvent() {
+        companion object {
+            /** Builds the event for product [cards] shown together: "single" for one, otherwise "carousel". */
+            fun forCards(cards: List<MultimodalElement>): CardsRendered = CardsRendered(
+                displayMode = if (cards.size == 1) "single" else "carousel",
+                elements = cards.map { cardElementDict(it.content) }
+            )
+
+            /** The product fields reported for a card in cardsRendered and cardClicked. */
+            fun cardElementDict(content: Map<String, Any>): Map<String, Any> =
+                listOf("productName", "productDescription", "productPageURL", "productPrice", "productBadge")
+                    .mapNotNull { key -> content[key]?.let { key to it } }
+                    .toMap()
+        }
+    }
 
     data class FeedbackSubmitted(
         val conversationId: String,

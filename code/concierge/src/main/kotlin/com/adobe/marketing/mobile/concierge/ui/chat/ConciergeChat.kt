@@ -378,7 +378,7 @@ internal fun ConciergeChat(
                     privacyNotice = ConciergeTheme.behavior?.privacyNotice,
                     onCtaButtonClick = { cta ->
                         onEvent(CtaButtonClick(cta))
-                        handleLink(cta.url, ConciergeConstants.TrackingEvent.LinkClickOrigin.CTA)
+                        cta.url?.let { handleLink(it, ConciergeConstants.TrackingEvent.LinkClickOrigin.CTA) }
                                        },
                     modifier = Modifier
                         .fillMaxSize()

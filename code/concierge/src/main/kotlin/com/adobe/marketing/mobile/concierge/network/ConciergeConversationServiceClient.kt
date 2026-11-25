@@ -471,7 +471,10 @@ internal class ConciergeConversationServiceClient(
     @Throws(IOException::class)
     private fun validateResponseCode(connection: HttpConnecting) {
         val responseCode = connection.responseCode
-        if (responseCode !in 200..299) {
+        if (responseCode in 200..299) {
+            Log.trace(ConciergeConstants.EXTENSION_NAME, TAG, "Received HTTP status $responseCode")
+        } else {
+            Log.warning(ConciergeConstants.EXTENSION_NAME, TAG, "Received HTTP error status $responseCode")
             throw ConciergeHttpStatusException(
                 responseCode,
                 "HTTP error: $responseCode ${connection.responseMessage}"

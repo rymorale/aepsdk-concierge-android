@@ -128,12 +128,60 @@ class ConciergeConversationTest {
         assertEquals("video", (reply.elements[3] as ConciergeElement.Unknown).type)
 
         assertEquals(
-            listOf(names.SESSION_INITIALIZED, names.QUERY_SUBMITTED, names.RESPONSE_STARTED, names.RESPONSE_COMPLETED),
+            listOf(
+                names.SESSION_INITIALIZED, names.QUERY_SUBMITTED, names.RESPONSE_STARTED,
+                names.RESPONSE_COMPLETED, names.CARDS_RENDERED
+            ),
             dispatched.map { it.name }
         )
         assertEquals("running shoes", dispatched[1].eventData[keys.QUERY])
         assertEquals("conv-1", dispatched[3].eventData[keys.CONVERSATION_ID])
         assertEquals("interaction-1", dispatched[3].eventData[keys.INTERACTION_ID])
+        assertEquals("single", dispatched[4].eventData[keys.DISPLAY_MODE])
+        assertEquals(
+            listOf(mapOf("productName" to "Runner", "productPageURL" to "https://example.com/runner")),
+            dispatched[4].eventData[keys.ELEMENTS]
+        )
+    }
+
+    @Test
+    fun `a response without ids reports them as unknown`() = runTest {
+        service.responses = flowOf(
+            completed("Hello").copy(conversationId = null, interactionId = null)
+        )
+        val conversation = conversation()
+
+        conversation.send("hi")
+
+        val events = dispatched.filter { it.name == names.RESPONSE_STARTED || it.name == names.RESPONSE_COMPLETED }
+        assertEquals(2, events.size)
+        events.forEach {
+            assertEquals("unknown", it.eventData[keys.CONVERSATION_ID])
+            assertEquals("unknown", it.eventData[keys.INTERACTION_ID])
+        }
+        assertTrue(dispatched.none { it.name == names.CARDS_RENDERED })
+    }
+
+    @Test
+    fun `a CTA without a url is delivered and tracked without a link`() = runTest {
+        service.responses = flowOf(
+            completed(
+                "Need help?",
+                listOf(RawMultimodalElement(0, "ctaButton", null, emptyMap(), ParsedMultimodalItem.Cta(CtaButton("Call us"))))
+            )
+        )
+        val conversation = conversation()
+        conversation.send("help")
+
+        val cta = conversation.messages.value.last().elements.single() as ConciergeElement.CtaButton
+        assertEquals("Call us", cta.label)
+        assertNull(cta.url)
+
+        dispatched.clear()
+        conversation.track(ConciergeInteraction.CtaClicked(cta.label, cta.url))
+
+        assertEquals(listOf(names.CTA_BUTTON_CLICKED), dispatched.map { it.name })
+        assertEquals("", dispatched[0].eventData[keys.URL])
     }
 
     @Test
