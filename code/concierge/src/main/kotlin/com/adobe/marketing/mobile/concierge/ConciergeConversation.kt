@@ -81,18 +81,32 @@ sealed class ConciergeConversationState {
 }
 
 /** Why a [ConciergeConversation] response failed. */
-enum class ConciergeError {
+sealed class ConciergeError {
     /** The service couldn't be reached, or the connection dropped. */
-    UNREACHABLE,
+    object Unreachable : ConciergeError() {
+        override fun toString() = "Unreachable"
+    }
 
     /** The request or the data handoff took too long. */
-    TIMEOUT,
+    object Timeout : ConciergeError() {
+        override fun toString() = "Timeout"
+    }
 
-    /** The service returned an error, or a response with nothing to show. */
-    INVALID_RESPONSE_DATA,
+    /** The service returned an error state, or a response with nothing to show. */
+    object InvalidResponseData : ConciergeError() {
+        override fun toString() = "InvalidResponseData"
+    }
+
+    /** The service answered with a non-2xx HTTP status [code], such as 401, 429 or 500. */
+    data class HttpStatus(val code: Int) : ConciergeError()
 
     /** Any other failure. */
-    UNKNOWN
+    object Unknown : ConciergeError() {
+        override fun toString() = "Unknown"
+    }
+
+    // Only a dropped or slow connection can succeed when sent again unchanged.
+    internal val isTransport: Boolean get() = this == Unreachable || this == Timeout
 }
 
 /** Why a [ConciergeConversation] closed. */
@@ -475,7 +489,7 @@ class ConciergeConversation internal constructor(
         var completed = false
         var overlappedBackground = false
         var failure: String? = null
-        var error = ConciergeError.UNKNOWN
+        var error: ConciergeError = ConciergeError.Unknown
     }
 
     // INTERRUPTED: the response failed while the app was in the background and will be sent again.
@@ -564,7 +578,7 @@ class ConciergeConversation internal constructor(
             }
         }
     } catch (e: DataHandoffTimeoutException) {
-        failTurn(turn, e.message ?: "Data handoff timed out", ConciergeError.TIMEOUT)
+        failTurn(turn, e.message ?: "Data handoff timed out", ConciergeError.Timeout)
         DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.DELIVERY_TIMEOUT)
     }
 
@@ -592,10 +606,10 @@ class ConciergeConversation internal constructor(
                 }
                 .collect { onResponse(turn, it) }
             return when {
-                errorDetail != null -> failTurn(turn, errorDetail!!, ConciergeError.INVALID_RESPONSE_DATA)
+                errorDetail != null -> failTurn(turn, errorDetail!!, ConciergeError.InvalidResponseData)
                 hasResponse(turn) -> finishTurn()
                 else -> failTurn(
-                    turn, "Conversation ended with no response content", ConciergeError.INVALID_RESPONSE_DATA,
+                    turn, "Conversation ended with no response content", ConciergeError.InvalidResponseData,
                     TurnOutcome.EMPTY
                 )
             }
@@ -604,9 +618,7 @@ class ConciergeConversation internal constructor(
         } catch (e: Exception) {
             val error = e.toConciergeError()
             // A connection dropped after the full response arrived leaves nothing to recover.
-            return if (turn.completed && (error == ConciergeError.UNREACHABLE || error == ConciergeError.TIMEOUT) &&
-                hasResponse(turn)
-            ) {
+            return if (turn.completed && error.isTransport && hasResponse(turn)) {
                 finishTurn()
             } else {
                 failTurn(turn, "Failed to process response: ${e.message}", error)
@@ -615,11 +627,11 @@ class ConciergeConversation internal constructor(
     }
 
     // An HTTP status error is a server rejection, not a dropped connection.
-    private fun Exception.toConciergeError() = when (this) {
-        is ConciergeHttpStatusException -> ConciergeError.INVALID_RESPONSE_DATA
-        is SocketTimeoutException -> ConciergeError.TIMEOUT
-        is IOException -> ConciergeError.UNREACHABLE
-        else -> ConciergeError.UNKNOWN
+    private fun Exception.toConciergeError(): ConciergeError = when (this) {
+        is ConciergeHttpStatusException -> ConciergeError.HttpStatus(statusCode)
+        is SocketTimeoutException -> ConciergeError.Timeout
+        is IOException -> ConciergeError.Unreachable
+        else -> ConciergeError.Unknown
     }
 
     private fun onResponse(turn: Turn, response: ParsedConversationMessage) {
@@ -687,7 +699,7 @@ class ConciergeConversation internal constructor(
         _messages.update { messages -> messages.filterNot { it.id == turn.agentMessageId } }
         interactionIds.remove(turn.agentMessageId)
         val interruptedInBackground = turn.allowsBackgroundResend && turn.overlappedBackground && !turn.completed &&
-            (error == ConciergeError.UNREACHABLE || error == ConciergeError.TIMEOUT)
+            error.isTransport
         if (interruptedInBackground) {
             Log.debug(ConciergeConstants.EXTENSION_NAME, TAG, "$detail while in the background. Resending in the foreground.")
             turn.failure = detail

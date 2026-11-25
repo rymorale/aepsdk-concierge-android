@@ -86,10 +86,13 @@ val state by conversation.state.collectAsStateWithLifecycle()
 
 | Error | Meaning |
 | --- | --- |
-| `UNREACHABLE` | The service couldn't be reached. |
-| `TIMEOUT` | The request timed out. |
-| `INVALID_RESPONSE_DATA` | The service returned an error status, an error, or no response. |
-| `UNKNOWN` | Any other error. |
+| `Unreachable` | The service couldn't be reached, or the connection dropped. |
+| `Timeout` | The request timed out. |
+| `InvalidResponseData` | The service returned an error state, or a response with nothing to show. |
+| `HttpStatus(code)` | The service answered with a non-2xx HTTP status, such as 401 (check the auth token), 429 (too many requests) or 500. |
+| `Unknown` | Any other error. |
+
+Every failure is also reported as an `ErrorOccurred` event with the detail, including the HTTP status code.
 
 `Closed.reason` is a `ConciergeCloseReason`:
 
@@ -104,7 +107,7 @@ Only one reply runs at a time. `send` ignores a message while the state is `Resp
 
 After a failure, `retry()` sends the failed message again without adding another user message. A failed data handoff can't be retried.
 
-If the app goes to the background during a reply and the reply then fails to reach the service, the conversation sends the message once more when the app returns to the foreground, unless the session has expired. If that also fails, `state` is `Failed`.
+If the app goes to the background during a reply and the reply then fails with `Unreachable` or `Timeout`, the conversation sends the message once more when the app returns to the foreground, unless the session has expired. If that also fails, `state` is `Failed`.
 
 `send` returns a `ConciergeSendResult`. You can ignore it, or use it to keep the user's text when a message wasn't sent:
 

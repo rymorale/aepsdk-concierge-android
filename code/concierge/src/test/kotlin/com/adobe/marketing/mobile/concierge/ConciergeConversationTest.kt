@@ -143,7 +143,7 @@ class ConciergeConversationTest {
 
         conversation.send("hello")
 
-        assertEquals(ConciergeConversationState.Failed(ConciergeError.INVALID_RESPONSE_DATA), conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.InvalidResponseData), conversation.state.value)
         assertEquals(listOf(ConciergeMessage.Role.USER), conversation.messages.value.map { it.role })
         val error = dispatched.single { it.name == names.ERROR_OCCURRED }
         assertEquals("Conversation error: Server unavailable", error.eventData[keys.ERROR_MESSAGE])
@@ -156,7 +156,7 @@ class ConciergeConversationTest {
 
         conversation.send("hello")
 
-        assertEquals(ConciergeConversationState.Failed(ConciergeError.INVALID_RESPONSE_DATA), conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.InvalidResponseData), conversation.state.value)
         assertEquals(1, conversation.messages.value.size)
     }
 
@@ -330,7 +330,7 @@ class ConciergeConversationTest {
             listOf(DataHandoffDeliveryResult.Failed(ConciergeDataHandoffRejectReason.DELIVERY_TIMEOUT)),
             handoffResults
         )
-        assertEquals(ConciergeConversationState.Failed(ConciergeError.TIMEOUT), conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.Timeout), conversation.state.value)
         assertEquals(listOf("Order placed"), conversation.messages.value.map { it.text })
     }
 
@@ -376,7 +376,7 @@ class ConciergeConversationTest {
         service.responses = emptyFlow()
         val conversation = conversation()
         conversation.send("hello")
-        assertEquals(ConciergeConversationState.Failed(ConciergeError.INVALID_RESPONSE_DATA), conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.InvalidResponseData), conversation.state.value)
 
         service.responses = flowOf(completed("Answer"))
         assertEquals(ConciergeSendResult.ACCEPTED, conversation.retry())
@@ -450,7 +450,7 @@ class ConciergeConversationTest {
 
         background.value = false
 
-        assertEquals(ConciergeConversationState.Failed(ConciergeError.UNREACHABLE), conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.Unreachable), conversation.state.value)
         assertEquals(listOf("hello", "hello"), service.queries)
         assertEquals(1, dispatched.count { it.name == names.ERROR_OCCURRED })
     }
@@ -466,7 +466,18 @@ class ConciergeConversationTest {
         service.responses = flowOf(completed("Answer"))
         background.value = false
 
-        assertEquals(ConciergeConversationState.Failed(ConciergeError.UNREACHABLE), conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.Unreachable), conversation.state.value)
+        assertEquals(listOf("hello"), service.queries)
+    }
+
+    @Test
+    fun `an HTTP status error in the background is not resent`() = runTest {
+        service.responses = flow { throw ConciergeHttpStatusException(429, "HTTP error: 429 Too Many Requests") }
+        val conversation = conversation(appInBackground = MutableStateFlow(true))
+
+        conversation.send("hello")
+
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.HttpStatus(429)), conversation.state.value)
         assertEquals(listOf("hello"), service.queries)
     }
 
@@ -491,14 +502,16 @@ class ConciergeConversationTest {
     fun `an HTTP status error after a complete response fails the turn`() = runTest {
         service.responses = flow {
             emit(completed("Answer"))
-            throw ConciergeHttpStatusException(500, "Server error")
+            throw ConciergeHttpStatusException(500, "HTTP error: 500 Internal Server Error")
         }
         val conversation = conversation()
 
         conversation.send("hello")
 
-        assertEquals(ConciergeConversationState.Failed(ConciergeError.INVALID_RESPONSE_DATA), conversation.state.value)
+        assertEquals(ConciergeConversationState.Failed(ConciergeError.HttpStatus(500)), conversation.state.value)
         assertEquals(listOf(ConciergeMessage.Role.USER), conversation.messages.value.map { it.role })
+        val error = dispatched.single { it.name == names.ERROR_OCCURRED }
+        assertEquals("Failed to process response: HTTP error: 500 Internal Server Error", error.eventData[keys.ERROR_MESSAGE])
     }
 
     @Test
